@@ -150,6 +150,8 @@ export interface RosterRow {
   summonable: boolean;
   /** Whether this unit is currently flying escort on the commander (optimistic). */
   escorting: boolean;
+  /** True for the commander's mothership row. */
+  isMother: boolean;
 }
 
 /** One build-platform option in the command UI. */

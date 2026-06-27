@@ -356,15 +356,15 @@ export function CarrierHud({
         </div>
       )}
 
-      {/* Fleet Log — direct-control (left-click) or summon/escort (right-click) any owned unit */}
+      {/* Fleet Log — fly any owned hull; drones escort on right-click */}
       {online && state.roster.length > 0 && (
         <div className="pointer-events-auto absolute left-5 top-14 w-60 rounded-md border border-white/15 bg-black/50 p-3 text-xs backdrop-blur-sm">
           <div className="mb-1 flex items-center justify-between uppercase tracking-widest text-white/50">
-            <span>Fleet Log</span>
-            <span className="text-white/30">Tab</span>
+            <span>Your Fleet</span>
+            <span className="text-white/30">Tab ⇄</span>
           </div>
           <div className="mb-2 text-[9px] leading-tight text-white/35">
-            Left-click: take control · Right-click: summon/escort
+            LMB: fly this ship · RMB: drone escort · Tab: carrier ↔ last ship
           </div>
           <div className="flex flex-col gap-1.5">
             {state.roster.map((u) => {
@@ -378,12 +378,11 @@ export function CarrierHud({
               return (
                 <button
                   key={u.id}
-                  onClick={() => !active && onBecome(u.id)}
+                  onClick={() => onBecome(u.id)}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     if (u.summonable) onSummon(u.id);
                   }}
-                  disabled={active}
                   className={`flex items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors ${
                     active
                       ? "cursor-default border-[#00d4ff] bg-[#00d4ff]/15"
@@ -393,10 +392,12 @@ export function CarrierHud({
                   }`}
                   title={
                     active
-                      ? "Currently controlling"
+                      ? "You are flying this ship"
                       : u.summonable
-                        ? `Left-click to control ${u.label} · right-click to ${u.escorting ? "recall" : "summon as escort"}`
-                        : `Take control of ${u.label}`
+                        ? `Fly ${u.label} (LMB) · ${u.escorting ? "Recall escort" : "Order to escort"} (RMB)`
+                        : u.isMother
+                          ? `Fly the carrier (LMB) · Tab also toggles here`
+                          : `Fly ${u.label} (LMB)`
                   }
                 >
                   <span style={{ color: accent }}>{ROSTER_ICON[u.kind] ?? "●"}</span>
@@ -697,7 +698,7 @@ export function CarrierHud({
       {/* Controls hint */}
       <div className="absolute bottom-5 right-5 text-right text-[10px] leading-relaxed text-white/40">
         <div>W/S throttle · A/D yaw · ↑/↓ pitch · Q/E roll</div>
-        <div>Mouse aim (click to lock) · LMB/Space fire · RMB missiles · Shift boost · Tab swap</div>
+        <div>Mouse aim (click to lock) · LMB/Space fire · RMB missiles · Shift boost · Tab carrier↔ship</div>
       </div>
     </div>
   );

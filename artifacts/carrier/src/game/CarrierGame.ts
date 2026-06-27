@@ -110,7 +110,7 @@ const TUTORIAL_STEPS: { title: string; body: string; maxMs: number }[] = [
   { title: "Maneuver", body: "A / D to turn · ↑ / ↓ to pitch · move the mouse to aim. Click once to lock the cursor.", maxMs: 11000 },
   { title: "Afterburner", body: "Hold Shift to boost — watch the afterburner gauge heat up.", maxMs: 8000 },
   { title: "Weapons", body: "LMB or Space to fire cannons · RMB to launch homing missiles.", maxMs: 9000 },
-  { title: "Command", body: "Spend credits below to Deploy fleet & Build platforms · Tab swaps ships · M opens the map.", maxMs: 9000 },
+  { title: "Command", body: "Fleet Log (left): click any ship to fly it · right-click drones to escort · Tab toggles carrier ↔ your last ship.", maxMs: 9000 },
   { title: "Engage", body: "You're cleared for combat, Commander. Hostiles inbound — good hunting.", maxMs: 5500 },
 ];
 
@@ -156,6 +156,13 @@ export class CarrierGame {
 
   private socket = new CarrierSocket();
   private selfId: string | null = null;
+  /** The commander's mothership entity id (from economy snapshots). */
+  private motherShipId: string | null = null;
+  /**
+   * Last non-carrier hull the commander piloted — Tab toggles between this and
+   * the mothership (not a full roster cycle).
+   */
+  private lastPilotedId: string | null = null;
   private controlledEntityId: string | null = null;
 
   private self: EntityState;
@@ -348,13 +355,14 @@ export class CarrierGame {
   }
 
   start(): void {
-    // The self mesh is built lazily by updateSelfMesh once the controlled
-    // entity's kind is known (fighter at first, then whatever you "become").
+    // The self mesh tracks whichever hull the commander is piloting (any owned
+    // entity via become — fighter, carrier, or fleet unit).
     this.socket.onStatus = (s) => { this.status = s; };
     this.socket.onWelcome = (m) => {
       this.selfId = m.id;
-      this.controlledEntityId = m.id;
-      this.self.id = m.id;
+      // Fighter entity id === player id by convention; authoritative control id
+      // arrives on the first snapshot — seed last-piloted for Tab toggle.
+      this.lastPilotedId = m.id;
       this.socket.send({ t: "join", name: this.opts.name, shipType: this.opts.shipType, faction: this.opts.faction });
     };
     this.socket.onSnapshot = (m) => this.onSnapshot(m);
@@ -1150,11 +1158,20 @@ export class CarrierGame {
     if (this.selfId) {
       const eco = m.economy.find((e) => e.playerId === this.selfId);
       if (eco) {
+        this.motherShipId = eco.motherShipId;
         // When control switches to a different entity, drop any inputs still
         // queued for the old one — the server discards queued commands on
         // `become`, so replaying them onto the new entity would jitter it.
         if (eco.controlledEntityId !== this.controlledEntityId) this.pending = [];
+        const prev = this.controlledEntityId;
         this.controlledEntityId = eco.controlledEntityId;
+        const auth = map.get(eco.controlledEntityId);
+        if (auth && auth.kind !== "mother_ship") {
+          this.lastPilotedId = eco.controlledEntityId;
+        } else if (prev && prev !== eco.motherShipId && map.get(prev)?.alive) {
+          // Switched to carrier — remember what we just left as "last piloted".
+          this.lastPilotedId = prev;
+        }
       }
     }
 
@@ -1399,9 +1416,16 @@ export class CarrierGame {
 
   // ---- become / build -------------------------------------------------------
 
-  /** Request direct control of an owned entity (server validates ownership). */
+  /** Request direct control of any owned hull (fighter, carrier, or fleet unit). */
   become(entityId: string): void {
-    if (this.status !== "connected") return;
+    if (this.status !== "connected" || !this.selfId) return;
+    const e = this.latestEntities.get(entityId);
+    if (!e || e.owner !== this.selfId || !e.alive) return;
+    if (entityId === this.controlledEntityId) return;
+    if (e.kind !== "mother_ship") this.lastPilotedId = entityId;
+    else if (this.controlledEntityId && this.controlledEntityId !== this.motherShipId) {
+      this.lastPilotedId = this.controlledEntityId;
+    }
     this.socket.send({ t: "become", entityId });
   }
 
@@ -1427,16 +1451,39 @@ export class CarrierGame {
     this.socket.send({ t: "build", kind });
   }
 
-  /** Tab cycles control through all owned, living units (carrier + fleet). */
+  /**
+   * Tab toggles between the mothership and the last piloted hull (fighter,
+   * drone, etc.) — not a full roster cycle. Use Fleet Log clicks to jump to
+   * any specific ship.
+   */
   private cycleControl(): void {
-    if (this.status !== "connected" || !this.selfId) return;
-    const owned = [...this.latestEntities.values()]
-      .filter((e) => e.owner === this.selfId && e.alive)
-      .sort((a, b) => kindRank(a) - kindRank(b) || a.id.localeCompare(b.id));
-    if (owned.length === 0) return;
-    const idx = owned.findIndex((e) => e.id === this.controlledEntityId);
-    const next = owned[(idx + 1) % owned.length];
-    if (next && next.id !== this.controlledEntityId) this.become(next.id);
+    if (this.status !== "connected" || !this.selfId || !this.motherShipId) return;
+    const mother = this.motherShipId;
+    const cur = this.controlledEntityId;
+    if (cur === mother) {
+      const target = this.resolveLastPiloted();
+      if (target && target !== mother) this.become(target);
+    } else {
+      if (cur && cur !== mother) this.lastPilotedId = cur;
+      this.become(mother);
+    }
+  }
+
+  /** Pick the last piloted hull if still alive, else the personal fighter. */
+  private resolveLastPiloted(): string | null {
+    const mother = this.motherShipId;
+    if (this.lastPilotedId && this.lastPilotedId !== mother) {
+      const e = this.latestEntities.get(this.lastPilotedId);
+      if (e && e.owner === this.selfId && e.alive) return this.lastPilotedId;
+    }
+    if (this.selfId) {
+      const fighter = this.latestEntities.get(this.selfId);
+      if (fighter && fighter.alive) return this.selfId;
+    }
+    for (const e of this.latestEntities.values()) {
+      if (e.owner === this.selfId && e.alive && e.kind !== "mother_ship") return e.id;
+    }
+    return null;
   }
 
   /** True while the controlled unit is a mothership (camera modes available). */
@@ -2344,6 +2391,7 @@ export class CarrierGame {
         active: entity.id === ceid,
         summonable,
         escorting: this.escorting.has(entity.id),
+        isMother: entity.kind === "mother_ship",
       });
     }
     roster.sort((a, b) => kindRank2(a.kind) - kindRank2(b.kind) || a.id.localeCompare(b.id));
