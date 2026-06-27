@@ -1,4 +1,4 @@
-FROM node:24-alpine AS builder
+FROM node:24-bookworm-slim AS builder
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ ENV BASE_PATH=/ PORT=8080 NODE_ENV=production
 RUN pnpm --filter @workspace/api-server run build
 RUN pnpm --filter @workspace/carrier run build
 
-FROM node:24-alpine AS runner
+FROM node:24-bookworm-slim AS runner
 
 WORKDIR /app
 
@@ -30,6 +30,6 @@ ENV STATIC_DIR=/app/artifacts/carrier/dist/public
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1:${PORT}/api/healthz" >/dev/null 2>&1 || exit 1
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "--enable-source-maps", "artifacts/api-server/dist/index.mjs"]
