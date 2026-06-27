@@ -1,0 +1,26 @@
+{
+  "name": "@workspace/vfx",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "peerDependencies": {
+    "three": "^0.184.0"
+  },
+  "dependencies": {
+    "three.quarks": "^0.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/three": "^0.184.1",
+    "three": "^0.184.0",
+    "vite": "catalog:",
+    "vitest": "^4.1.8"
+  }
+}
