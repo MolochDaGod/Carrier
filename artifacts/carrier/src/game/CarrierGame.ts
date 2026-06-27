@@ -109,7 +109,7 @@ const TUTORIAL_STEPS: { title: string; body: string; maxMs: number }[] = [
   { title: "Throttle", body: "Hold W to fire your engines and pull away from the carrier.", maxMs: 9000 },
   { title: "Maneuver", body: "A / D to turn · ↑ / ↓ to pitch · move the mouse to aim. Click once to lock the cursor.", maxMs: 11000 },
   { title: "Afterburner", body: "Hold Shift to boost — watch the afterburner gauge heat up.", maxMs: 8000 },
-  { title: "Weapons", body: "Press Space or F to fire your cannons.", maxMs: 9000 },
+  { title: "Weapons", body: "LMB or Space to fire cannons · RMB to launch homing missiles.", maxMs: 9000 },
   { title: "Command", body: "Spend credits below to Deploy fleet & Build platforms · Tab swaps ships · M opens the map.", maxMs: 9000 },
   { title: "Engage", body: "You're cleared for combat, Commander. Hostiles inbound — good hunting.", maxMs: 5500 },
 ];
@@ -199,12 +199,20 @@ export class CarrierGame {
   private projs = new Map<number, ProjectileState>();
   private projMeshes = new Map<number, THREE.Mesh>();
   private projTrails = new Map<number, VfxHandle>();
+  /** Position history for spline missile trails (id → recent world points). */
+  private projHistory = new Map<number, THREE.Vector3[]>();
+  private projSplines = new Map<number, THREE.Line>();
   // Spinning shuriken bolt: a flat throwing-star disc (normal +Z) that whirls
   // down its line of travel, trailing a quarks flame/particle exhaust.
   private projGeo = makeShurikenGeometry(2.6);
   private projMat = new THREE.MeshBasicMaterial({
     color: 0xfff1c2, transparent: true, opacity: 0.98,
     depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+  });
+  private missileGeo = new THREE.ConeGeometry(1.4, 5.2, 6);
+  private missileMat = new THREE.MeshBasicMaterial({
+    color: 0xff6622, transparent: true, opacity: 0.95,
+    depthWrite: false, blending: THREE.AdditiveBlending,
   });
 
   /** Shared combat VFX (rocket exhaust trails + impact bursts). */
@@ -268,6 +276,8 @@ export class CarrierGame {
   private backdrops: THREE.Object3D[] = [];
 
   private keys = new Set<string>();
+  /** 0 = LMB primary, 2 = RMB missile. */
+  private mouseBtns = new Set<number>();
   private mouseDx = 0;
   private mouseDy = 0;
   private pointerLocked = false;
@@ -407,7 +417,7 @@ export class CarrierGame {
     // Shared combat VFX layer (quarks). Prototypes load async; track()/play()
     // are no-ops until ready, so spawning before load simply skips the effect.
     this.vfx = new VfxManager(this.scene);
-    this.vfx.load(["fireSparks", "explosion", "muzzleFlash"]).catch(() => {});
+    this.vfx.load(["fireSparks", "explosion", "muzzleFlash", "projectileTrail"]).catch(() => {});
   }
 
   /** Load the two environment GLBs once and park them far outside the arena. */
@@ -600,10 +610,11 @@ export class CarrierGame {
     // ride the hull group; the tag is a billboarded canvas sprite, the shield a
     // translucent additive sphere whose opacity tracks the deflector charge.
     const r = this.hullRadius(entity);
-    const tag = this.makeNameTag(r * 2.6);
-    tag.position.y = r * 1.7;
+    const tag = this.makeNameTag(r * 1.35);
+    tag.position.y = r * 1.45;
     g.add(tag);
     g.userData.nameTag = tag;
+    g.userData.tagBaseScale = tag.scale.x;
     if (entity.maxShield > 0) {
       const bubble = this.makeShieldBubble(r * 1.25);
       g.add(bubble);
@@ -639,17 +650,18 @@ export class CarrierGame {
 
   /** Paint a name-tag sprite's text (no-op when unchanged). */
   private setTagText(sprite: THREE.Sprite, text: string, color: string): void {
-    if (sprite.userData.text === text) return;
-    sprite.userData.text = text;
+    const key = `${text}|${color}`;
+    if (sprite.userData.text === key) return;
+    sprite.userData.text = key;
     const canvas = sprite.userData.canvas as HTMLCanvasElement;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.font = "bold 30px ui-sans-serif, system-ui, sans-serif";
+    ctx.font = "bold 22px ui-monospace, Consolas, monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.lineWidth = 6;
-    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(0,0,0,0.75)";
     ctx.strokeText(text, canvas.width / 2, canvas.height / 2);
     ctx.fillStyle = color;
     ctx.fillText(text, canvas.width / 2, canvas.height / 2);
@@ -740,10 +752,10 @@ export class CarrierGame {
    * to the (transient) mothership group — `disposeMother` frees them on teardown.
    */
   private addMotherTurrets(g: THREE.Group, accent: string, shipType: number, faction: FactionId): void {
-    const len = SHIP_FIT * MOTHER_SHIP.scaleFactor;
-    const size = len * 0.06; // smart-scaled down relative to the capital hull
-    // A modest, performant count of hero turrets down the upper spine.
-    const count = Math.min(8, Math.max(4, Math.round(motherTurretVisualCount(shipType) / 3)));
+    // Match thruster + station fit so turrets land on the rendered hull mesh.
+    const len = stationFit(faction);
+    const size = len * 0.048;
+    const count = Math.min(10, Math.max(5, Math.round(motherTurretVisualCount(shipType) / 2.5)));
     const turrets: Turret[] = [];
     g.userData.turrets = turrets;
     g.userData.turretFaction = faction;
@@ -754,12 +766,12 @@ export class CarrierGame {
     let placed = 0;
     for (let r = 0; r < rows && placed < count; r++) {
       const zt = rows === 1 ? 0 : r / (rows - 1);
-      const z = (zt - 0.5) * len * 0.7;
+      const z = (zt - 0.5) * len * 0.62;
       for (const sx of [-1, 1]) {
         if (placed >= count) break;
         placed++;
-        const pos = new THREE.Vector3(sx * len * 0.09, len * 0.1, z);
-        Turret.create({ size, beamColor: accent, range: len * 2.4 })
+        const pos = new THREE.Vector3(sx * len * 0.13, len * 0.11, z);
+        Turret.create({ size, beamColor: accent, range: len * 2.6 })
           .then((t) => {
             if (this.disposed || !this.motherGroups.has(g)) {
               t.dispose();
@@ -1014,6 +1026,9 @@ export class CarrierGame {
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
     this.renderer.domElement.addEventListener("click", this.onCanvasClick);
+    this.renderer.domElement.addEventListener("mousedown", this.onMouseDown);
+    this.renderer.domElement.addEventListener("mouseup", this.onMouseUp);
+    this.renderer.domElement.addEventListener("contextmenu", this.onContextMenu);
     document.addEventListener("pointerlockchange", this.onPointerLockChange);
     window.addEventListener("mousemove", this.onMouseMove);
     window.addEventListener("resize", this.onResize);
@@ -1044,6 +1059,16 @@ export class CarrierGame {
   private onCanvasClick = () => {
     if (this.cinematicActive) this.endCinematic();
     if (!this.pointerLocked) this.renderer.domElement.requestPointerLock?.();
+  };
+  private onMouseDown = (e: MouseEvent) => {
+    if (e.button === 0 || e.button === 2) this.mouseBtns.add(e.button);
+    if (e.button === 0 && !this.pointerLocked) this.onCanvasClick();
+  };
+  private onMouseUp = (e: MouseEvent) => {
+    this.mouseBtns.delete(e.button);
+  };
+  private onContextMenu = (e: MouseEvent) => {
+    if (this.pointerLocked) e.preventDefault();
   };
   private onPointerLockChange = () => {
     this.pointerLocked = document.pointerLockElement === this.renderer.domElement;
@@ -1079,10 +1104,14 @@ export class CarrierGame {
     this.mouseDx = 0;
     this.mouseDy = 0;
     const boost = down("ShiftLeft", "ShiftRight");
-    const fire = down("Space") || down("KeyF");
+    const fire = down("Space") || down("KeyF") || this.mouseBtns.has(0);
+    const missile = this.mouseBtns.has(2);
     const clamp1 = (v: number) => (v < -1 ? -1 : v > 1 ? 1 : v);
-    return { seq: ++this.seq, dt, thrust: clamp1(thrust), yaw: clamp1(yaw),
-      pitch: clamp1(pitch), roll: clamp1(roll), boost, fire };
+    return {
+      seq: ++this.seq, dt,
+      thrust: clamp1(thrust), yaw: clamp1(yaw), pitch: clamp1(pitch), roll: clamp1(roll),
+      boost, fire, missile,
+    };
   }
 
   // ---- net ------------------------------------------------------------------
@@ -1147,8 +1176,13 @@ export class CarrierGame {
     for (const id of [...this.projs.keys()]) if (!seen.has(id)) this.projs.delete(id);
 
     for (const ev of m.events) {
-      if (ev.k === "explode") this.spawnExplosion(ev.px, ev.py, ev.pz);
-      else if (ev.k === "impact") this.spawnImpact(ev.px, ev.py, ev.pz);
+      if (ev.k === "explode") this.spawnExplosion(ev.px, ev.py, ev.pz, true);
+      else if (ev.k === "hit") {
+        this.spawnImpact(ev.px, ev.py, ev.pz);
+        this.vfx?.play("explosion", new THREE.Vector3(ev.px, ev.py, ev.pz), { scale: 0.55, ttl: 420 });
+      } else if (ev.k === "fire") {
+        this.vfx?.play("muzzleFlash", new THREE.Vector3(ev.px, ev.py, ev.pz), { scale: 0.9, ttl: 120 });
+      } else if (ev.k === "impact") this.spawnImpact(ev.px, ev.py, ev.pz);
       else if (ev.k === "reward") this.spawnPickup(ev.px, ev.py, ev.pz);
     }
   }
@@ -1501,22 +1535,52 @@ export class CarrierGame {
     }
   }
 
+  /** Short combat label — no long name·uid spam above every hull. */
+  private entityLabel(s: EntityState): { text: string; color: string; show: boolean } {
+    const ceid = this.controlledEntityId;
+    const own = s.owner === this.selfId;
+    if (s.id === ceid) return { text: "", color: "#8fe3ff", show: false };
+    if (s.team === ENEMY.team) {
+      const boss = s.id === BOSS.id;
+      return { text: boss ? "DREADLORD" : "HOSTILE", color: "#ff5a45", show: true };
+    }
+    if (s.kind === "mother_ship") {
+      return { text: own ? "CARRIER" : "CAPITAL", color: own ? "#66ddff" : "#aabbcc", show: true };
+    }
+    if (s.kind === "fleet_unit" && s.role !== "none") {
+      const def = fleetRoleDef(s.role);
+      return { text: (def?.label ?? s.role).toUpperCase(), color: ROLE_COLORS[s.role], show: true };
+    }
+    if (own) return { text: s.kind === "fighter" ? "FIGHTER" : "ALLY", color: "#8fe3ff", show: true };
+    return { text: "UNIT", color: "#cccccc", show: true };
+  }
+
   /** Per-frame refresh of an entity group's name tag + shield bubble. */
   private updateEntityDecor(g: THREE.Object3D, s: EntityState): void {
     const tag = g.userData.nameTag as THREE.Sprite | undefined;
     if (tag) {
-      const own = s.owner === this.selfId;
-      const color = s.team === ENEMY.team ? "#ff6a5a" : own ? "#8fe3ff" : "#ffffff";
-      const uid = (s.uid ?? s.id).slice(0, 4).toUpperCase();
-      this.setTagText(tag, `${s.name}  ·  ${uid}`, color);
-      tag.visible = s.alive;
+      const label = this.entityLabel(s);
+      const dx = s.px - this.self.px, dy = s.py - this.self.py, dz = s.pz - this.self.pz;
+      const dist = Math.hypot(dx, dy, dz);
+      const maxDist = s.team === ENEMY.team ? 3200 : 2200;
+      const show = s.alive && label.show && dist < maxDist;
+      if (show) this.setTagText(tag, label.text, label.color);
+      tag.visible = show;
+      if (show) {
+        const scale = Math.max(0.55, Math.min(1.1, 1.2 - dist / maxDist));
+        const base = (g.userData.tagBaseScale as number) ?? tag.scale.x;
+        tag.scale.set(base * scale, base * 0.22 * scale, 1);
+      }
     }
     const bubble = g.userData.shieldBubble as THREE.Mesh | undefined;
     if (bubble) {
       const frac = s.maxShield > 0 ? s.shield / s.maxShield : 0;
       const mat = bubble.material as THREE.MeshBasicMaterial;
-      mat.opacity = s.alive ? Math.max(0, Math.min(1, frac)) * 0.22 : 0;
-      bubble.visible = s.alive && frac > 0.01;
+      const pulse = 0.85 + 0.15 * Math.sin(performance.now() * 0.004);
+      mat.opacity = s.alive ? Math.max(0, Math.min(1, frac)) * 0.28 * pulse : 0;
+      bubble.visible = s.alive && frac > 0.02;
+      const sc = 1 + frac * 0.08;
+      bubble.scale.setScalar(sc);
     }
   }
 
@@ -1527,23 +1591,51 @@ export class CarrierGame {
     const seen = new Set<number>();
     for (const [id, p] of this.projs) {
       seen.add(id);
+      const isMissile = p.kind === "missile";
       let mesh = this.projMeshes.get(id);
       if (!mesh) {
-        mesh = new THREE.Mesh(this.projGeo, this.projMat);
+        mesh = new THREE.Mesh(isMissile ? this.missileGeo : this.projGeo,
+          isMissile ? this.missileMat : this.projMat);
         this.scene.add(mesh);
         this.projMeshes.set(id, mesh);
-        // Rocket exhaust: a quarks particle/flame trail riding the bolt.
-        const trail = this.vfx?.track("fireSparks", mesh.position, { scale: 1.6 });
+        const trail = this.vfx?.track(
+          isMissile ? "projectileTrail" : "fireSparks",
+          mesh.position,
+          { scale: isMissile ? 2.2 : 1.6, color: isMissile ? "#ff6622" : undefined },
+        );
         if (trail) this.projTrails.set(id, trail);
+        if (isMissile) this.projHistory.set(id, []);
       }
       mesh.position.set(p.px + p.vx * extrap, p.py + p.vy * extrap, p.pz + p.vz * extrap);
-      // Spin the throwing-star: disc normal (local +Z) faces travel; whirl in-plane.
       const sp = Math.hypot(p.vx, p.vy, p.vz);
       if (sp > 1e-3) {
         _bdir.set(p.vx / sp, p.vy / sp, p.vz / sp);
         _bquat.setFromUnitVectors(LOCAL_NOSE, _bdir);
-        _spinQ.setFromAxisAngle(_bdir, spin);
-        mesh.quaternion.copy(_spinQ).multiply(_bquat);
+        if (isMissile) {
+          mesh.quaternion.copy(_bquat);
+          const hist = this.projHistory.get(id)!;
+          hist.push(mesh.position.clone());
+          if (hist.length > 14) hist.shift();
+          if (hist.length >= 3) {
+            const curve = new THREE.CatmullRomCurve3(hist, false, "catmullrom", 0.35);
+            const pts = curve.getPoints(18);
+            let line = this.projSplines.get(id);
+            if (!line) {
+              const geo = new THREE.BufferGeometry().setFromPoints(pts);
+              line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+                color: 0xff8844, transparent: true, opacity: 0.55,
+                depthWrite: false, blending: THREE.AdditiveBlending,
+              }));
+              this.scene.add(line);
+              this.projSplines.set(id, line);
+            } else {
+              (line.geometry as THREE.BufferGeometry).setFromPoints(pts);
+            }
+          }
+        } else {
+          _spinQ.setFromAxisAngle(_bdir, spin);
+          mesh.quaternion.copy(_spinQ).multiply(_bquat);
+        }
       }
       this.projTrails.get(id)?.setPosition(mesh.position);
     }
@@ -1553,6 +1645,14 @@ export class CarrierGame {
         this.projMeshes.delete(id);
         const trail = this.projTrails.get(id);
         if (trail) { trail.stop(); this.projTrails.delete(id); }
+        const line = this.projSplines.get(id);
+        if (line) {
+          this.scene.remove(line);
+          line.geometry.dispose();
+          (line.material as THREE.Material).dispose();
+          this.projSplines.delete(id);
+        }
+        this.projHistory.delete(id);
       }
     }
   }
@@ -1712,7 +1812,7 @@ export class CarrierGame {
       case 2: return k.has("KeyA") || k.has("KeyD") || k.has("ArrowLeft") ||
                      k.has("ArrowRight") || k.has("ArrowUp") || k.has("ArrowDown");
       case 3: return k.has("ShiftLeft") || k.has("ShiftRight") || sp > SHIP.maxSpeed + 1;
-      case 4: return k.has("Space") || k.has("KeyF");
+      case 4: return k.has("Space") || k.has("KeyF") || this.mouseBtns.has(0);
       default: return false; // info steps advance on their timeout
     }
   }
@@ -1798,23 +1898,28 @@ export class CarrierGame {
     this.camera.updateProjectionMatrix();
   }
 
-  private spawnExplosion(x: number, y: number, z: number): void {
+  private spawnExplosion(x: number, y: number, z: number, big = false): void {
+    const pos = new THREE.Vector3(x, y, z);
+    this.vfx?.play("explosion", pos, { scale: big ? 1.4 : 0.85, ttl: big ? 900 : 600 });
     const mat = new THREE.MeshBasicMaterial({ color: 0xff6622, transparent: true, opacity: 0.9 });
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(SCALE.ship.miner, 10, 10), mat);
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(SCALE.ship.miner * (big ? 1.6 : 1), 10, 10),
+      mat,
+    );
     mesh.position.set(x, y, z);
     this.scene.add(mesh);
     const born = performance.now();
+    const dur = big ? 950 : 700;
     const tick = () => {
       if (this.disposed) return;
-      const t = (performance.now() - born) / 700;
+      const t = (performance.now() - born) / dur;
       if (t >= 1) { this.scene.remove(mesh); mesh.geometry.dispose(); mat.dispose(); return; }
-      mesh.scale.setScalar(1 + t * 12);
+      mesh.scale.setScalar(1 + t * (big ? 18 : 12));
       mat.opacity = 0.9 * (1 - t);
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
-    // Upgrade to the GLB burst once it has streamed in (cached after first hit).
-    this.ensureExplosionTemplate(x, y, z);
+    if (big) this.ensureExplosionTemplate(x, y, z);
   }
 
   /** Lazy-load the 19 MB explosion GLB; spawn a clone at (x,y,z) when ready. */
@@ -2287,6 +2392,9 @@ export class CarrierGame {
       controllingMother: this.controllingMother(),
       cinematic: this.cinematicActive,
       hint: this.tutorialHint(),
+      aiming: this.pointerLocked,
+      firingPrimary: this.mouseBtns.has(0) || this.keys.has("Space") || this.keys.has("KeyF"),
+      firingMissile: this.mouseBtns.has(2),
     });
   }
 
@@ -2369,6 +2477,9 @@ export class CarrierGame {
     window.removeEventListener("resize", this.onResize);
     document.removeEventListener("pointerlockchange", this.onPointerLockChange);
     this.renderer.domElement.removeEventListener("click", this.onCanvasClick);
+    this.renderer.domElement.removeEventListener("mousedown", this.onMouseDown);
+    this.renderer.domElement.removeEventListener("mouseup", this.onMouseUp);
+    this.renderer.domElement.removeEventListener("contextmenu", this.onContextMenu);
     this.renderer.domElement.removeEventListener("wheel", this.onWheel);
     if (this.pointerLocked) document.exitPointerLock?.();
 
@@ -2389,8 +2500,17 @@ export class CarrierGame {
     this.projTrails.clear();
     for (const mesh of this.projMeshes.values()) this.scene.remove(mesh);
     this.projMeshes.clear();
+    for (const line of this.projSplines.values()) {
+      this.scene.remove(line);
+      line.geometry.dispose();
+      (line.material as THREE.Material).dispose();
+    }
+    this.projSplines.clear();
+    this.projHistory.clear();
     this.projGeo.dispose();
     this.projMat.dispose();
+    this.missileGeo.dispose();
+    this.missileMat.dispose();
     // Dispose VFX before the scene.traverse sweep so quarks frees its own batch.
     this.vfx?.dispose();
     this.vfx = null;

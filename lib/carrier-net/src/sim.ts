@@ -438,6 +438,7 @@ const ZERO_CMD: InputCommand = {
   roll: 0,
   boost: false,
   fire: false,
+  missile: false,
 };
 
 function len(x: number, y: number, z: number): number {
@@ -515,13 +516,20 @@ export function fleetIntent(unit: EntityState, ctx: FleetContext): InputCommand 
   // Fire when armed, engaging a hostile, and pointed close enough at it.
   const def = fleetRoleDef(unit.role);
   let fire = false;
+  let boost = false;
   if (def && def.armed && goal.engage && ctx.hostile) {
     const h = ctx.hostile;
     const d = len(h.px - unit.px, h.py - unit.py, h.pz - unit.pz);
+    const aimTol = unit.role === "scout" || unit.role === "corsair" ? 0.38 : 0.28;
     fire =
       d <= def.fireRange &&
-      Math.abs(steer.yawDiff) < 0.25 &&
-      Math.abs(steer.pitchDiff) < 0.25;
+      Math.abs(steer.yawDiff) < aimTol &&
+      Math.abs(steer.pitchDiff) < aimTol;
+    // Drone fighters close fast and weave — light afterburner while engaging.
+    if (goal.engage && (unit.role === "scout" || unit.role === "corsair") && d > 90) {
+      boost = true;
+      steer.thrust = Math.min(1, steer.thrust + 0.25);
+    }
   }
 
   return {
@@ -531,8 +539,9 @@ export function fleetIntent(unit: EntityState, ctx: FleetContext): InputCommand 
     yaw: steer.yaw,
     pitch: steer.pitch,
     roll: 0,
-    boost: false,
+    boost,
     fire,
+    missile: false,
   };
 }
 
@@ -672,14 +681,16 @@ export function escortIntent(unit: EntityState, ctx: EscortContext): InputComman
   if (def && def.armed && engage && ctx.hostile) {
     const h = ctx.hostile;
     const d = len(h.px - unit.px, h.py - unit.py, h.pz - unit.pz);
+    const aimTol = unit.role === "scout" || unit.role === "corsair" ? 0.38 : 0.28;
     fire =
       d <= def.fireRange &&
-      Math.abs(steer.yawDiff) < 0.25 &&
-      Math.abs(steer.pitchDiff) < 0.25;
+      Math.abs(steer.yawDiff) < aimTol &&
+      Math.abs(steer.pitchDiff) < aimTol;
   }
 
-  // Catch up to a distant, moving player while not engaging.
-  const boost = !engage && steer.dist > ESCORT.catchUpDist;
+  // Catch up to a distant, moving player while not engaging; drone escorts boost in combat.
+  let boost = !engage && steer.dist > ESCORT.catchUpDist;
+  if (engage && def?.armed && (unit.role === "scout" || unit.role === "corsair")) boost = true;
 
   return {
     seq: 0,
@@ -690,5 +701,6 @@ export function escortIntent(unit: EntityState, ctx: EscortContext): InputComman
     roll: 0,
     boost,
     fire,
+    missile: false,
   };
 }

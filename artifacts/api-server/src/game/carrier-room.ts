@@ -42,6 +42,7 @@ import {
   ESCORT,
   SHIELD,
   WEAPON,
+  MISSILE,
   WORLD_SEED,
   applyCelestialForces,
   damageEntity,
@@ -106,6 +107,7 @@ interface Player {
   queue: InputCommand[];
   lastSeq: number;
   lastFireAt: number;
+  lastMissileAt: number;
   credits: number;
   lastDeployAt: number;
   joined: boolean;
@@ -143,6 +145,8 @@ type LiveProjectile = ProjectileState & {
   dieAt: number;
   /** Player id of whoever fired — used to suppress friendly fire. */
   ownerPlayer: string;
+  /** Per-projectile damage override (missiles hit harder). */
+  damage?: number;
 };
 
 /** Per-fleet-unit server-only bookkeeping (never sent on the wire). */
@@ -219,6 +223,7 @@ function steerToward(
     roll: 0,
     boost: false,
     fire: false,
+    missile: false,
   };
 }
 
@@ -612,6 +617,7 @@ export class CarrierRoom {
       queue: [],
       lastSeq: 0,
       lastFireAt: 0,
+      lastMissileAt: 0,
       credits: CARRIER.startCredits,
       lastDeployAt: 0,
       joined: false,
@@ -974,6 +980,7 @@ export class CarrierRoom {
         stepShip(entity, cmd, dt);
         p.lastSeq = cmd.seq;
         if (cmd.fire) this.tryFire(entity, p.id, now, () => p.lastFireAt, (t) => { p.lastFireAt = t; });
+        if (cmd.missile) this.tryMissile(entity, p.id, now, () => p.lastMissileAt, (t) => { p.lastMissileAt = t; });
       }
     }
 
@@ -1091,7 +1098,13 @@ export class CarrierRoom {
         const [fx, fy, fz] = forwardVec(e.yaw, e.pitch);
         const aim = dist > 1e-3 ? (fx * dx + fy * dy + fz * dz) / dist : 0;
         if (dist <= ENEMY.fireRange && aim >= ENEMY.fireAim && this.tickCount >= meta.fireReadyTick) {
-          this.spawnProjectile(e, e.owner, this.now());
+          const lead = dist / WEAPON.projectileSpeed;
+          this.spawnProjectileAt(
+            e, e.owner, this.now(),
+            target.px + target.vx * lead,
+            target.py + target.vy * lead,
+            target.pz + target.vz * lead,
+          );
           meta.fireReadyTick = this.tickCount + ENEMY.fireCooldownTicks;
         }
         continue;
@@ -1143,7 +1156,13 @@ export class CarrierRoom {
       const [fx, fy, fz] = forwardVec(e.yaw, e.pitch);
       const aim = dist > 1e-3 ? (fx * dx + fy * dy + fz * dz) / dist : 0;
       if (dist <= BOSS.fireRange && aim >= BOSS.fireAim && this.tickCount >= meta.fireReadyTick) {
-        this.spawnProjectile(e, e.owner, this.now());
+        const lead = dist / WEAPON.projectileSpeed;
+        this.spawnProjectileAt(
+          e, e.owner, this.now(),
+          target.px + target.vx * lead,
+          target.py + target.vy * lead,
+          target.pz + target.vz * lead,
+        );
         meta.fireReadyTick = this.tickCount + BOSS.fireCooldownTicks;
       }
       return;
@@ -1579,9 +1598,47 @@ export class CarrierRoom {
     this.spawnProjectile(entity, ownerPlayer, now);
   }
 
+  private tryMissile(
+    entity: EntityState,
+    ownerPlayer: string,
+    now: number,
+    getLast: () => number,
+    setLast: (t: number) => void,
+  ): void {
+    if (!entity.alive) return;
+    if (now - getLast() < MISSILE.cooldownMs) return;
+    setLast(now);
+    this.spawnMissile(entity, ownerPlayer, now);
+  }
+
   /** Fire one bolt along the entity's facing and record laser-beam endpoints. */
   private spawnProjectile(entity: EntityState, ownerPlayer: string, now: number): void {
     const [fx, fy, fz] = forwardVec(entity.yaw, entity.pitch);
+    this.pushBolt(entity, ownerPlayer, now, fx, fy, fz);
+  }
+
+  /** Fire one bolt toward a world point (lead targeting for AI). */
+  private spawnProjectileAt(
+    entity: EntityState,
+    ownerPlayer: string,
+    now: number,
+    tx: number,
+    ty: number,
+    tz: number,
+  ): void {
+    const dx = tx - entity.px, dy = ty - entity.py, dz = tz - entity.pz;
+    const d = Math.hypot(dx, dy, dz) || 1;
+    this.pushBolt(entity, ownerPlayer, now, dx / d, dy / d, dz / d);
+  }
+
+  private pushBolt(
+    entity: EntityState,
+    ownerPlayer: string,
+    now: number,
+    fx: number,
+    fy: number,
+    fz: number,
+  ): void {
     const mx = entity.px + fx * WEAPON.muzzleForward;
     const my = entity.py + fy * WEAPON.muzzleForward;
     const mz = entity.pz + fz * WEAPON.muzzleForward;
@@ -1589,6 +1646,7 @@ export class CarrierRoom {
       id: nextProjectileId++,
       owner: entity.id,
       ownerPlayer,
+      kind: "bolt",
       px: mx, py: my, pz: mz,
       vx: fx * WEAPON.projectileSpeed + entity.vx,
       vy: fy * WEAPON.projectileSpeed + entity.vy,
@@ -1602,6 +1660,27 @@ export class CarrierRoom {
       y: my + fy * LASER_LEN,
       z: mz + fz * LASER_LEN,
     });
+  }
+
+  /** Launch a homing missile along the ship's nose. */
+  private spawnMissile(entity: EntityState, ownerPlayer: string, now: number): void {
+    const [fx, fy, fz] = forwardVec(entity.yaw, entity.pitch);
+    const mx = entity.px + fx * MISSILE.muzzleForward;
+    const my = entity.py + fy * MISSILE.muzzleForward;
+    const mz = entity.pz + fz * MISSILE.muzzleForward;
+    this.projectiles.push({
+      id: nextProjectileId++,
+      owner: entity.id,
+      ownerPlayer,
+      kind: "missile",
+      px: mx, py: my, pz: mz,
+      vx: fx * MISSILE.projectileSpeed + entity.vx * 0.35,
+      vy: fy * MISSILE.projectileSpeed + entity.vy * 0.35,
+      vz: fz * MISSILE.projectileSpeed + entity.vz * 0.35,
+      dieAt: now + MISSILE.projectileLifeMs,
+      damage: MISSILE.damage,
+    });
+    this.events.push({ k: "fire", px: mx, py: my, pz: mz });
   }
 
   /**
@@ -1706,12 +1785,53 @@ export class CarrierRoom {
     return best;
   }
 
+  /** Nearest hostile entity a projectile may home toward or splash-damage. */
+  private nearestHostileTo(
+    pr: LiveProjectile,
+    radius: number,
+  ): EntityState | null {
+    const shooter = this.entities.get(pr.owner);
+    let best: EntityState | null = null;
+    let bestD2 = radius * radius;
+    for (const target of this.entities.values()) {
+      if (!target.alive || target.id === pr.owner) continue;
+      if (shooter && shooter.team === target.team) continue;
+      if (target.owner === pr.ownerPlayer) continue;
+      const dx = target.px - pr.px, dy = target.py - pr.py, dz = target.pz - pr.pz;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < bestD2) { bestD2 = d2; best = target; }
+    }
+    return best;
+  }
+
   private stepProjectiles(now: number): void {
     const dt = TICK_DT;
     const alive: LiveProjectile[] = [];
     const deadFleet = new Set<string>();
     for (const pr of this.projectiles) {
       if (now >= pr.dieAt) continue;
+
+      // Guided missiles steer toward the nearest hostile each tick (spline-like arc).
+      if (pr.kind === "missile") {
+        const target = this.nearestHostileTo(pr, 1400);
+        if (target) {
+          const dx = target.px - pr.px, dy = target.py - pr.py, dz = target.pz - pr.pz;
+          const d = Math.hypot(dx, dy, dz) || 1;
+          const wantVx = (dx / d) * MISSILE.projectileSpeed;
+          const wantVy = (dy / d) * MISSILE.projectileSpeed;
+          const wantVz = (dz / d) * MISSILE.projectileSpeed;
+          const k = Math.min(1, MISSILE.homingStrength * dt);
+          pr.vx += (wantVx - pr.vx) * k;
+          pr.vy += (wantVy - pr.vy) * k;
+          pr.vz += (wantVz - pr.vz) * k;
+          const sp = Math.hypot(pr.vx, pr.vy, pr.vz) || 1;
+          const cap = MISSILE.projectileSpeed * 1.15;
+          if (sp > cap) {
+            pr.vx *= cap / sp; pr.vy *= cap / sp; pr.vz *= cap / sp;
+          }
+        }
+      }
+
       pr.px += pr.vx * dt; pr.py += pr.vy * dt; pr.pz += pr.vz * dt;
       const a = SHIP.arena;
       if (Math.abs(pr.px) > a || Math.abs(pr.py) > a || Math.abs(pr.pz) > a) continue;
@@ -1734,10 +1854,17 @@ export class CarrierRoom {
         if (shooter && shooter.team === target.team) continue;
         if (target.owner === pr.ownerPlayer) continue;
         const dx = target.px - pr.px, dy = target.py - pr.py, dz = target.pz - pr.pz;
-        if (dx * dx + dy * dy + dz * dz <= WEAPON.hitRadius * WEAPON.hitRadius) {
-          this.applyDamage(target, pr.owner, now);
+        const hitR = pr.kind === "missile" ? MISSILE.hitRadius : WEAPON.hitRadius;
+        if (dx * dx + dy * dy + dz * dz <= hitR * hitR) {
+          if (pr.kind === "missile") {
+            this.detonateMissile(pr, now, deadFleet);
+          } else {
+            this.applyDamage(target, pr.owner, now, pr.damage);
+          }
           this.events.push({ k: "hit", px: pr.px, py: pr.py, pz: pr.pz });
-          if (!target.alive && target.kind === "fleet_unit") deadFleet.add(target.id);
+          if (pr.kind !== "missile" && !target.alive && target.kind === "fleet_unit") {
+            deadFleet.add(target.id);
+          }
           hit = true;
           break;
         }
@@ -1768,9 +1895,35 @@ export class CarrierRoom {
    * shield-hit clock so regen is delayed), then the hull takes the remainder.
    * On hull depletion the entity is killed via the unified `killEntity`.
    */
-  private applyDamage(entity: EntityState, attackerId: string, now: number): void {
+  /** Missile detonation: splash damage + big explosion FX. */
+  private detonateMissile(
+    pr: LiveProjectile,
+    now: number,
+    deadFleet: Set<string>,
+  ): void {
+    const dmg = pr.damage ?? MISSILE.damage;
+    const r2 = MISSILE.splashRadius * MISSILE.splashRadius;
+    const shooter = this.entities.get(pr.owner);
+    for (const target of this.entities.values()) {
+      if (!target.alive || target.id === pr.owner) continue;
+      if (shooter && shooter.team === target.team) continue;
+      if (target.owner === pr.ownerPlayer) continue;
+      const dx = target.px - pr.px, dy = target.py - pr.py, dz = target.pz - pr.pz;
+      if (dx * dx + dy * dy + dz * dz > r2) continue;
+      this.applyDamage(target, pr.owner, now, dmg);
+      if (!target.alive && target.kind === "fleet_unit") deadFleet.add(target.id);
+    }
+    this.events.push({ k: "explode", px: pr.px, py: pr.py, pz: pr.pz });
+  }
+
+  private applyDamage(
+    entity: EntityState,
+    attackerId: string,
+    now: number,
+    overrideDmg?: number,
+  ): void {
     const attacker = this.entities.get(attackerId);
-    const dmg = attacker ? weaponDamageFor(attacker) : WEAPON.damage;
+    const dmg = overrideDmg ?? (attacker ? weaponDamageFor(attacker) : WEAPON.damage);
     const shieldBefore = entity.shield;
     damageEntity(entity, dmg);
     if (entity.shield < shieldBefore) this.shieldHitAt.set(entity.id, now);
@@ -1836,6 +1989,7 @@ export class CarrierRoom {
       id: p.id, owner: p.owner,
       px: p.px, py: p.py, pz: p.pz,
       vx: p.vx, vy: p.vy, vz: p.vz,
+      kind: p.kind,
     }));
 
     const economy: PlayerEconomy[] = [];

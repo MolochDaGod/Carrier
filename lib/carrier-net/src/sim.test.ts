@@ -50,6 +50,7 @@ const cmd = (over: Partial<InputCommand> = {}): InputCommand => ({
   roll: 0,
   boost: false,
   fire: false,
+  missile: false,
   ...over,
 });
 

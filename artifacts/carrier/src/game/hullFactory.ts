@@ -148,11 +148,14 @@ export function autoOrientShip(obj: THREE.Object3D): void {
   _aoBox.setFromObject(obj);
   _aoBox.getSize(_aoSize);
   _aoBox.getCenter(_aoCenter);
-  const alongX = _aoSize.x >= _aoSize.z;
-  const half = (alongX ? _aoSize.x : _aoSize.z) * 0.5 || 1;
-  const cut = 0.45 * half; // only the outer ~10% of each end votes
-  const cLng = alongX ? _aoCenter.x : _aoCenter.z;
-  const cPer = alongX ? _aoCenter.z : _aoCenter.x;
+  // Pick the hull's longest axis (X, Y, or Z) as the nose-tail line.
+  const axis = _aoSize.x >= _aoSize.y && _aoSize.x >= _aoSize.z ? "x"
+    : _aoSize.y >= _aoSize.z ? "y" : "z";
+  const half = (axis === "x" ? _aoSize.x : axis === "y" ? _aoSize.y : _aoSize.z) * 0.5 || 1;
+  const cut = 0.45 * half;
+  const cLng = axis === "x" ? _aoCenter.x : axis === "y" ? _aoCenter.y : _aoCenter.z;
+  const cPerA = axis === "x" ? _aoCenter.z : axis === "y" ? _aoCenter.x : _aoCenter.x;
+  const cPerB = axis === "x" ? _aoCenter.y : axis === "y" ? _aoCenter.z : _aoCenter.y;
 
   let total = 0;
   obj.traverse((o) => {
@@ -168,8 +171,11 @@ export function autoOrientShip(obj: THREE.Object3D): void {
     for (let k = 0; k < pos.count; k++, i++) {
       if (i % step !== 0) continue;
       _aoV.fromBufferAttribute(pos, k).applyMatrix4(o.matrixWorld);
-      const lng = (alongX ? _aoV.x : _aoV.z) - cLng;
-      const r = Math.abs((alongX ? _aoV.z : _aoV.x) - cPer);
+      const lng = (axis === "x" ? _aoV.x : axis === "y" ? _aoV.y : _aoV.z) - cLng;
+      const r = Math.hypot(
+        (axis === "x" ? _aoV.z : axis === "y" ? _aoV.x : _aoV.x) - cPerA,
+        (axis === "x" ? _aoV.y : axis === "y" ? _aoV.z : _aoV.y) - cPerB,
+      );
       if (lng > cut) { frontR += r; frontN++; }
       else if (lng < -cut) { backR += r; backN++; }
     }
@@ -177,10 +183,13 @@ export function autoOrientShip(obj: THREE.Object3D): void {
   const fAvg = frontN ? frontR / frontN : Infinity;
   const bAvg = backN ? backR / backN : Infinity;
   const noseSign = fAvg <= bAvg ? 1 : -1; // +1 → nose at +length end
-  const nx = alongX ? noseSign : 0;
-  const nz = alongX ? 0 : noseSign;
-  // World-Y rotation that maps the nose direction onto +Z.
-  _aoQ.setFromAxisAngle(_aoUp, -Math.atan2(nx, nz));
+  const nose = new THREE.Vector3(
+    axis === "x" ? noseSign : 0,
+    axis === "y" ? noseSign : 0,
+    axis === "z" ? noseSign : 0,
+  );
+  // Rotate the detected nose axis onto the engine's canonical +Z forward.
+  _aoQ.setFromUnitVectors(nose.normalize(), new THREE.Vector3(0, 0, 1));
   obj.quaternion.premultiply(_aoQ);
 }
 

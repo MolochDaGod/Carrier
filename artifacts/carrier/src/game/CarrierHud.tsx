@@ -526,18 +526,13 @@ export function CarrierHud({
         })()}
       </div>
 
-      {/* Reticle */}
-      {state.alive && online && (
-        <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
-          <div
-            className="h-5 w-5 rounded-full border"
-            style={{ borderColor: `${factionColor}cc` }}
-          />
-          <div
-            className="absolute left-1/2 top-1/2 h-0.5 w-0.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
-            style={{ background: factionColor }}
-          />
-        </div>
+      {/* Combat crosshair — brackets + centre pip; orange when RMB missiles armed */}
+      {state.alive && online && state.aiming && (
+        <CombatCrosshair
+          color={factionColor}
+          missile={state.firingMissile}
+          firing={state.firingPrimary}
+        />
       )}
 
       {/* Flight-training prompt (top-center, dismisses itself as you fly) */}
@@ -702,7 +697,7 @@ export function CarrierHud({
       {/* Controls hint */}
       <div className="absolute bottom-5 right-5 text-right text-[10px] leading-relaxed text-white/40">
         <div>W/S throttle · A/D yaw · ↑/↓ pitch · Q/E roll</div>
-        <div>Mouse aim (click to lock) · Shift boost · Space/F fire · Tab swap unit</div>
+        <div>Mouse aim (click to lock) · LMB/Space fire · RMB missiles · Shift boost · Tab swap</div>
       </div>
     </div>
   );
@@ -830,6 +825,49 @@ function StrategicMap({
         <Legend color="#ff3b30" label="Enemy" />
         <Legend color="#ffd23f" label="Reward" />
         <Legend color="#2bd96b" label="Outpost" />
+      </div>
+    </div>
+  );
+}
+
+/** Tactical reticle: corner brackets, centre dot, spread kick on fire. */
+function CombatCrosshair({
+  color,
+  missile,
+  firing,
+}: {
+  color: string;
+  missile: boolean;
+  firing: boolean;
+}) {
+  const accent = missile ? "#ff8844" : color;
+  const spread = firing ? 6 : missile ? 4 : 0;
+  const sz = 22 + spread;
+  const arm = 9;
+  const gap = 5;
+  const style = { borderColor: accent, boxShadow: `0 0 8px ${accent}55` };
+  return (
+    <div className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
+      <div className="relative" style={{ width: sz * 2, height: sz * 2 }}>
+        <span className="absolute border-l-2 border-t-2" style={{ ...style, left: 0, top: 0, width: arm, height: arm }} />
+        <span className="absolute border-r-2 border-t-2" style={{ ...style, right: 0, top: 0, width: arm, height: arm }} />
+        <span className="absolute border-l-2 border-b-2" style={{ ...style, left: 0, bottom: 0, width: arm, height: arm }} />
+        <span className="absolute border-r-2 border-b-2" style={{ ...style, right: 0, bottom: 0, width: arm, height: arm }} />
+        <div
+          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full"
+          style={{
+            width: missile ? 6 : 4,
+            height: missile ? 6 : 4,
+            background: accent,
+            boxShadow: `0 0 ${missile ? 10 : 6}px ${accent}`,
+          }}
+        />
+        {missile && (
+          <div
+            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-dashed opacity-60"
+            style={{ width: gap * 5, height: gap * 5, borderColor: accent }}
+          />
+        )}
       </div>
     </div>
   );

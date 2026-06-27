@@ -260,6 +260,12 @@ export interface CarrierHudState {
   cinematic: boolean;
   /** Active onboarding tutorial prompt, or null when not training / finished. */
   hint: TutorialHint | null;
+  /** Pointer lock engaged — combat crosshair is active. */
+  aiming: boolean;
+  /** LMB / primary held this frame. */
+  firingPrimary: boolean;
+  /** RMB / missile held this frame. */
+  firingMissile: boolean;
 }
 
 /** Mothership camera modes: chase-flight, orbit/survey, free-fly, and the opening cinematic. */

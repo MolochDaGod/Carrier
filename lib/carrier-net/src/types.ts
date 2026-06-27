@@ -124,6 +124,22 @@ export const WEAPON = {
   muzzleForward: 6,
 } as const;
 
+/** Player-fired homing missiles (RMB / secondary). Slower but heavier + guided. */
+export const MISSILE = {
+  cooldownMs: 1100,
+  projectileSpeed: 195,
+  projectileLifeMs: 4200,
+  damage: 34,
+  hitRadius: 16,
+  muzzleForward: 10,
+  /** How aggressively velocity steers toward the nearest hostile (1/s). */
+  homingStrength: 4.2,
+  /** Splash radius on detonation (m) — damages all hostiles in range once. */
+  splashRadius: 42,
+} as const;
+
+export type ProjectileKind = "bolt" | "missile";
+
 export const SHIP_TYPES = 6;
 
 /**
@@ -587,7 +603,7 @@ export const FLEET_ROLES: Record<Exclude<FleetRole, "none">, FleetRoleDef> = {
   },
   scout: {
     role: "scout",
-    label: "Scout",
+    label: "Scout Drone",
     cost: 55,
     cap: 6,
     scale: 8,
@@ -595,13 +611,13 @@ export const FLEET_ROLES: Record<Exclude<FleetRole, "none">, FleetRoleDef> = {
     maxShield: 30,
     zoneR: 460,
     speedMult: 1.25,
-    engageRange: 360,
-    fireRange: 200,
+    engageRange: 520,
+    fireRange: 240,
     armed: true,
   },
   corsair: {
     role: "corsair",
-    label: "Corsair",
+    label: "Corsair Drone",
     cost: 80,
     cap: 5,
     scale: 12,
@@ -609,8 +625,8 @@ export const FLEET_ROLES: Record<Exclude<FleetRole, "none">, FleetRoleDef> = {
     maxShield: 45,
     zoneR: 500,
     speedMult: 1.05,
-    engageRange: 420,
-    fireRange: 210,
+    engageRange: 580,
+    fireRange: 260,
     armed: true,
   },
   frigate: {
@@ -1029,7 +1045,10 @@ export interface InputCommand {
   pitch: number;
   roll: number;
   boost: boolean;
+  /** Primary weapons (LMB / Space / F). */
   fire: boolean;
+  /** Homing missile salvo (RMB). */
+  missile: boolean;
 }
 
 export interface ProjectileState {
@@ -1041,6 +1060,8 @@ export interface ProjectileState {
   vx: number;
   vy: number;
   vz: number;
+  /** Omitted or `"bolt"` for standard lasers; `"missile"` for guided rockets. */
+  kind?: ProjectileKind;
 }
 
 export type GameEvent =
