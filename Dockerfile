@@ -9,7 +9,12 @@ COPY artifacts ./artifacts
 COPY lib ./lib
 COPY attached_assets ./attached_assets
 
-RUN pnpm install --frozen-lockfile
+RUN printf '%s\n' \
+    'only-built-dependencies[]=esbuild' \
+    'only-built-dependencies[]=@swc/core' \
+    > .npmrc \
+    && pnpm install --frozen-lockfile \
+    && pnpm rebuild esbuild
 
 ENV BASE_PATH=/ PORT=8080 NODE_ENV=production
 
