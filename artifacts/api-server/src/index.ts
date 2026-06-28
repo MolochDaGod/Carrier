@@ -3,6 +3,7 @@ import { logger } from "./lib/logger";
 import { attachGameServer } from "./game/server";
 import { attachCarrierServer } from "./game/carrier-server";
 import { attachBrawlServer } from "./game/brawl-server";
+import { attachEngagementServer } from "./game/engagement-server";
 
 const rawPort = process.env["PORT"];
 
@@ -36,3 +37,6 @@ attachCarrierServer(server);
 
 // Ruins Brawler game server — isolated room on /api/brawl.
 attachBrawlServer(server);
+
+// Grudge Space RTS engagement lobbies — /api/engagement
+attachEngagementServer(server);
