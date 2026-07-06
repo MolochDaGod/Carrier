@@ -79,6 +79,7 @@ import {
 } from "./constants";
 import { SUN, sunPosition, SCALE } from "./scale";
 import { FACTION_ACCENT } from "./motherships";
+import { clampMechType, mechModelFor } from "./mechs";
 import {
   disposeGroup,
   fitObject,
@@ -363,7 +364,12 @@ export class CarrierGame {
       // Fighter entity id === player id by convention; authoritative control id
       // arrives on the first snapshot — seed last-piloted for Tab toggle.
       this.lastPilotedId = m.id;
-      this.socket.send({ t: "join", name: this.opts.name, shipType: this.opts.shipType, faction: this.opts.faction });
+      this.socket.send({
+        t: "join",
+        name: this.opts.name,
+        shipType: clampMechType(this.opts.shipType),
+        faction: this.opts.faction,
+      });
     };
     this.socket.onSnapshot = (m) => this.onSnapshot(m);
     this.socket.connect();
@@ -708,7 +714,10 @@ export class CarrierGame {
     const fb = this.makeFallbackShip(entity.shipType, isEnemy ? "#ff3b30" : FACTIONS[faction].color);
     g.add(fb);
     g.userData.fallback = fb;
-    this.requestShipModel(g, isEnemy ? FIGHTER_GLB.enemy : FIGHTER_GLB.player, faction, SHIP_FIT);
+    const model = isEnemy
+      ? FIGHTER_GLB.enemy
+      : mechModelFor(clampMechType(entity.shipType));
+    this.requestShipModel(g, model, faction, SHIP_FIT);
     // Animated rear boosters on the outer group (survive the async hull swap).
     attachThrusters(g, {
       kind: "fighter",

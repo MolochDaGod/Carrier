@@ -25,9 +25,9 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import type { FactionId } from "@workspace/carrier-net";
 import { loadAsset, type LoadedModel } from "@workspace/assets";
-import { DEPLOY_ROLES, fleetModelFor } from "./factionAssets";
 import { disposeGroup, loadShowcaseHull } from "./hullFactory";
-import { MOTHERSHIPS, type MothershipDef, type TurretMount } from "./motherships";
+import { mechModelFor, type MechDef } from "./mechs";
+
 import {
   validateModelFile,
   saveOverride,
@@ -74,7 +74,7 @@ export class MothershipShowcase {
   /** User-uploaded replacement scenes by asset id (owned; fully disposed). */
   private overrides: Record<string, THREE.Object3D> = {};
   /** The currently displayed selection, so uploads can rebuild in place. */
-  private current: { def: MothershipDef; accent: string; faction: FactionId } | null = null;
+  private current: { def: MechDef; accent: string; faction: FactionId } | null = null;
   private buildSeq = 0;
   private ready = false;
   private raf = 0;
@@ -181,7 +181,7 @@ export class MothershipShowcase {
    * emissive trim, so switching faction visibly refreshes the showcase even when
    * the same hull stays selected.
    */
-  select(def: MothershipDef, accent?: string, faction: FactionId = "scavengers"): void {
+  select(def: MechDef, accent?: string, faction: FactionId = "scavengers"): void {
     if (this.disposed) return;
     this.current = { def, accent: accent ?? def.accent, faction };
     void this.rebuildAsync();
@@ -278,9 +278,8 @@ export class MothershipShowcase {
 
   /** Resolve the catalog/override asset id backing a swappable slot. */
   private activeHullId(): string {
-    if (!this.current) return MOTHERSHIPS[0].hull;
-    const role = DEPLOY_ROLES[this.current.def.id] ?? DEPLOY_ROLES[0];
-    return fleetModelFor(this.current.faction, role).id;
+    if (!this.current) return mechModelFor(0).id;
+    return mechModelFor(this.current.def.id).id;
   }
 
   private slotId(slot: ShowcaseSlot): string {
@@ -306,8 +305,7 @@ export class MothershipShowcase {
     this.accentLightA.color.copy(accent).lerp(new THREE.Color(0xffffff), 0.25);
     this.accentLightB.color.copy(accent).lerp(new THREE.Color(0xffffff), 0.25);
 
-    const role = DEPLOY_ROLES[def.id] ?? DEPLOY_ROLES[0];
-    const shipModel = fleetModelFor(faction, role);
+    const shipModel = mechModelFor(def.id);
     let hull: THREE.Object3D | null = null;
     try {
       hull = await loadShowcaseHull(shipModel, faction, HULL_FIT * def.hullScale);
@@ -350,17 +348,6 @@ export class MothershipShowcase {
       group.add(makeFallbackHull(accent, def.hullScale));
     }
 
-    if (SHOW_PLATFORM) {
-      def.turrets.forEach((mount, i) => {
-        const turret = this.cloneTurret(mount, def.hullScale);
-        if (!turret) return;
-        const ang = (i / Math.max(1, def.turrets.length)) * Math.PI * 2 + Math.PI / 4;
-        const r = platformR * 0.72;
-        turret.position.set(Math.cos(ang) * r, platformTop, Math.sin(ang) * r);
-        group.add(turret);
-      });
-    }
-
     group.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(group);
     const center = new THREE.Vector3();
@@ -380,17 +367,6 @@ export class MothershipShowcase {
 
     this.composite = group;
     this.rig.add(group);
-  }
-
-  private cloneTurret(mount: TurretMount, hullScale: number): THREE.Object3D | null {
-    // Resource/healing turrets glow in a muted green, combat in a muted red.
-    const tint =
-      mount.role === "combat"
-        ? new THREE.Color("#b85c52")
-        : mount.role === "healing"
-          ? new THREE.Color("#6caa86")
-          : new THREE.Color("#6c8bb0");
-    return this.cloneFit(mount.model, TURRET_FIT * hullScale, tint, 0.28);
   }
 
   /** Resolve a model's source scene (user override first, then catalog). */

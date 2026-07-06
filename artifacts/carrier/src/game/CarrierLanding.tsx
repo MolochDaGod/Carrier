@@ -12,14 +12,15 @@ import { FACTIONS, FACTION_ORDER, type FactionId } from "@workspace/carrier-net"
 import { FactionEmblem } from "../components/FactionEmblem";
 import { CursorParticles } from "../components/CursorParticles";
 import { MothershipWireframe } from "./MothershipWireframe";
-import { MOTHERSHIPS, FACTION_ACCENT } from "./motherships";
+import { FACTION_ACCENT } from "./motherships";
+import { mechFor } from "./mechs";
 
 const DEFAULT_ACCENT = "#00d4ff";
 
-/** Each faction's representative hull for the landing wireframe preview. */
+/** Each faction's representative mech for the landing wireframe preview. */
 function defForFaction(id: FactionId) {
   const i = FACTION_ORDER.indexOf(id);
-  return MOTHERSHIPS[i] ?? MOTHERSHIPS[0];
+  return mechFor(i % 3);
 }
 
 /** Lightweight 2D warp-star field — drifting stars pulled toward the camera. */

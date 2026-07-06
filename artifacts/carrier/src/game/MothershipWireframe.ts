@@ -15,7 +15,7 @@
  */
 import * as THREE from "three";
 import { loadAsset, type LoadedModel } from "@workspace/assets";
-import type { MothershipDef } from "./motherships";
+import type { MechDef } from "./mechs";
 import { fleetModelFor } from "./factionAssets";
 
 /** Small harvester drone that orbits the hull (a representative deployable miner). */
@@ -90,7 +90,7 @@ export class MothershipWireframe {
    * `color`, with an orbiting drone. Loads the per-faction hull GLB (and the
    * shared drone) on demand; safe to call repeatedly on hover.
    */
-  async select(def: MothershipDef, color: string): Promise<void> {
+  async select(def: MechDef, color: string): Promise<void> {
     if (this.disposed) return;
     const myToken = ++this.loadToken;
 
@@ -113,7 +113,7 @@ export class MothershipWireframe {
     this.build(def, new THREE.Color(color));
   }
 
-  private build(def: MothershipDef, color: THREE.Color): void {
+  private build(def: MechDef, color: THREE.Color): void {
     if (this.composite) {
       this.rig.remove(this.composite);
       disposeGroup(this.composite);
