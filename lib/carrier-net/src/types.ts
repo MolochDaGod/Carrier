@@ -100,6 +100,14 @@ export const COLLISION = {
   separation: 0.85,
 } as const;
 
+/** Missile / AOE detonation knockback — applied server-side, mirrored on client. */
+export const EXPLOSION = {
+  /** Peak outward velocity impulse (m/s) at the blast centre. */
+  peakImpulse: 88,
+  /** Fraction of peak retained at the splash radius edge (linear falloff). */
+  edgeFalloff: 0.12,
+} as const;
+
 /**
  * Escort/summon command-AI tunables.  A summoned unit flies to a formation slot
  * beside the player's currently-controlled ship and protects it: it peels off to
@@ -1066,7 +1074,7 @@ export interface ProjectileState {
 
 export type GameEvent =
   | { k: "fire"; px: number; py: number; pz: number }
-  | { k: "explode"; px: number; py: number; pz: number }
+  | { k: "explode"; px: number; py: number; pz: number; radius?: number }
   | { k: "hit"; px: number; py: number; pz: number }
   | { k: "reward"; px: number; py: number; pz: number }
   | { k: "impact"; px: number; py: number; pz: number };

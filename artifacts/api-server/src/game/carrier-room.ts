@@ -45,6 +45,7 @@ import {
   MISSILE,
   WORLD_SEED,
   applyCelestialForces,
+  applyExplosionForce,
   damageEntity,
   fleetFireCooldownTicks,
   shieldRegenPerSecFor,
@@ -1913,7 +1914,14 @@ export class CarrierRoom {
       this.applyDamage(target, pr.owner, now, dmg);
       if (!target.alive && target.kind === "fleet_unit") deadFleet.add(target.id);
     }
-    this.events.push({ k: "explode", px: pr.px, py: pr.py, pz: pr.pz });
+    applyExplosionForce(this.entities.values(), pr.px, pr.py, pr.pz, MISSILE.splashRadius);
+    this.events.push({
+      k: "explode",
+      px: pr.px,
+      py: pr.py,
+      pz: pr.pz,
+      radius: MISSILE.splashRadius,
+    });
   }
 
   private applyDamage(

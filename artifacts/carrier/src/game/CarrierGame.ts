@@ -15,7 +15,7 @@
 import * as THREE from "three";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { loadAsset, type LoadedModel } from "@workspace/assets";
-import { VfxManager, type VfxHandle } from "@workspace/vfx";
+import { VfxManager, type TrailHandle, type VfxHandle } from "@workspace/vfx";
 import {
   FIGHTER_GLB,
   fleetModelFor,
@@ -32,6 +32,8 @@ import {
   FACTION_ORDER,
   FLEET_ROLES,
   FLEET_UNIT,
+  EXPLOSION,
+  MISSILE,
   MOTHER_SHIP,
   PLATFORM,
   PLATFORM_DEFS,
@@ -89,6 +91,7 @@ import {
 } from "./hullFactory";
 import { disposeHullOverrides } from "./hullOverrides";
 import { CarrierSocket } from "./net";
+import { sampleHullTurretMounts } from "./motherTurretMounts";
 import { Turret } from "./Turret";
 
 interface SnapEntry {
@@ -207,6 +210,8 @@ export class CarrierGame {
   private projs = new Map<number, ProjectileState>();
   private projMeshes = new Map<number, THREE.Mesh>();
   private projTrails = new Map<number, VfxHandle>();
+  /** Swept ribbon trails for homing missiles (VFX spline). */
+  private projWeaponTrails = new Map<number, TrailHandle>();
   /** Position history for spline missile trails (id → recent world points). */
   private projHistory = new Map<number, THREE.Vector3[]>();
   private projSplines = new Map<number, THREE.Line>();
@@ -746,7 +751,9 @@ export class CarrierGame {
     // client accent (matching the lit hull) so the fixtures read as part of the
     // painted-metal hull instead of glowing neon attachments; the firing beam is
     // brightened back to legible inside the Turret itself.
-    this.addMotherTurrets(g, FACTION_ACCENT[faction], shipType, faction);
+    g.userData.turretConfig = { accent: FACTION_ACCENT[faction], shipType, faction };
+    this.motherGroups.add(g);
+    this.tryMountMotherTurrets(g);
     // Capital boosters fire downward from a belly cluster — matching the engine
     // "legs" on the faction stations. On the outer group so they survive the swap.
     attachThrusters(g, {
@@ -762,47 +769,62 @@ export class CarrierGame {
   }
 
   /**
-   * Stud a mothership's upper hull with real animated turrets (the rigged
-   * heavy-metal-turret GLB). They load asynchronously and self-deploy; each
-   * tracks + fires at the nearest hostile every frame (see `updateTurrets`).
-   * The instances are stored on `g.userData.turrets` so their lifecycle is tied
-   * to the (transient) mothership group — `disposeMother` frees them on teardown.
+   * Mount animated hull turrets on the loaded station mesh using raycasted
+   * surface points (convex hull sampling) instead of a flat grid in space.
    */
-  private addMotherTurrets(g: THREE.Group, accent: string, shipType: number, faction: FactionId): void {
-    // Match thruster + station fit so turrets land on the rendered hull mesh.
+  private mountMotherTurrets(
+    g: THREE.Group,
+    hull: THREE.Object3D,
+    accent: string,
+    shipType: number,
+    faction: FactionId,
+  ): void {
+    this.clearMotherTurrets(g);
     const len = stationFit(faction);
     const size = len * 0.048;
     const count = Math.min(10, Math.max(5, Math.round(motherTurretVisualCount(shipType) / 2.5)));
     const turrets: Turret[] = [];
     g.userData.turrets = turrets;
     g.userData.turretFaction = faction;
-    this.motherGroups.add(g);
 
-    const up = new THREE.Vector3(0, 1, 0);
-    const rows = Math.ceil(count / 2);
-    let placed = 0;
-    for (let r = 0; r < rows && placed < count; r++) {
-      const zt = rows === 1 ? 0 : r / (rows - 1);
-      const z = (zt - 0.5) * len * 0.62;
-      for (const sx of [-1, 1]) {
-        if (placed >= count) break;
-        placed++;
-        const pos = new THREE.Vector3(sx * len * 0.13, len * 0.11, z);
-        Turret.create({ size, beamColor: accent, range: len * 2.6 })
-          .then((t) => {
-            if (this.disposed || !this.motherGroups.has(g)) {
-              t.dispose();
-              return;
-            }
-            t.mountOn(g, pos, up);
-            t.deploy();
-            turrets.push(t);
-          })
-          .catch(() => {
-            /* asset failed to load — hull simply shows no turret there */
-          });
-      }
+    const mounts = sampleHullTurretMounts(hull, count);
+    for (const mount of mounts) {
+      Turret.create({ size, beamColor: accent, range: len * 2.6 })
+        .then((t) => {
+          if (this.disposed || !this.motherGroups.has(g)) {
+            t.dispose();
+            return;
+          }
+          t.mountOn(g, mount.position, mount.normal);
+          t.deploy();
+          turrets.push(t);
+        })
+        .catch(() => { /* hull simply shows no turret there */ });
     }
+  }
+
+  private clearMotherTurrets(g: THREE.Group): void {
+    const turrets = g.userData.turrets as Turret[] | undefined;
+    if (turrets) {
+      for (const t of turrets) t.dispose();
+      turrets.length = 0;
+    }
+  }
+
+  /** Mount (or remount) turrets once a mothership hull mesh is available. */
+  private tryMountMotherTurrets(g: THREE.Group): void {
+    const cfg = g.userData.turretConfig as
+      | { accent: string; shipType: number; faction: FactionId }
+      | undefined;
+    if (!cfg) return;
+    const hull = (g.userData.glb ?? g.userData.fallback) as THREE.Object3D | undefined;
+    if (!hull) return;
+    const key = hull.uuid;
+    if (g.userData.turretHullKey === key && (g.userData.turrets as Turret[] | undefined)?.length) {
+      return;
+    }
+    g.userData.turretHullKey = key;
+    this.mountMotherTurrets(g, hull, cfg.accent, cfg.shipType, cfg.faction);
   }
 
   /** Free any animated turrets carried by a (mothership) group before disposal. */
@@ -1026,6 +1048,7 @@ export class CarrierGame {
     }
     group.add(model);
     group.userData.glb = model;
+    if (this.motherGroups.has(group)) this.tryMountMotherTurrets(group);
   }
 
   /** Faint wireframe sphere marking a unit's rated operation zone. */
@@ -1202,7 +1225,10 @@ export class CarrierGame {
     for (const id of [...this.projs.keys()]) if (!seen.has(id)) this.projs.delete(id);
 
     for (const ev of m.events) {
-      if (ev.k === "explode") this.spawnExplosion(ev.px, ev.py, ev.pz, true);
+      if (ev.k === "explode") {
+        this.spawnExplosion(ev.px, ev.py, ev.pz, true, ev.radius ?? MISSILE.splashRadius);
+        this.applyExplosionKick(ev.px, ev.py, ev.pz, ev.radius ?? MISSILE.splashRadius);
+      }
       else if (ev.k === "hit") {
         this.spawnImpact(ev.px, ev.py, ev.pz);
         this.vfx?.play("explosion", new THREE.Vector3(ev.px, ev.py, ev.pz), { scale: 0.55, ttl: 420 });
@@ -1660,7 +1686,15 @@ export class CarrierGame {
           { scale: isMissile ? 2.2 : 1.6, color: isMissile ? "#ff6622" : undefined },
         );
         if (trail) this.projTrails.set(id, trail);
-        if (isMissile) this.projHistory.set(id, []);
+        if (isMissile) {
+          this.projHistory.set(id, []);
+          const ribbon = this.vfx?.weaponTrail({
+            color: "#ff8844",
+            duration: 0.28,
+            segments: 20,
+          });
+          if (ribbon) this.projWeaponTrails.set(id, ribbon);
+        }
       }
       mesh.position.set(p.px + p.vx * extrap, p.py + p.vy * extrap, p.pz + p.vz * extrap);
       const sp = Math.hypot(p.vx, p.vy, p.vz);
@@ -1688,6 +1722,12 @@ export class CarrierGame {
               (line.geometry as THREE.BufferGeometry).setFromPoints(pts);
             }
           }
+          const ribbon = this.projWeaponTrails.get(id);
+          if (ribbon) {
+            const tailLen = 10 + Math.min(14, sp * 0.04);
+            _btail.copy(mesh.position).addScaledVector(_bdir, -tailLen);
+            ribbon.push(mesh.position, _btail);
+          }
         } else {
           _spinQ.setFromAxisAngle(_bdir, spin);
           mesh.quaternion.copy(_spinQ).multiply(_bquat);
@@ -1708,6 +1748,8 @@ export class CarrierGame {
           (line.material as THREE.Material).dispose();
           this.projSplines.delete(id);
         }
+        const ribbon = this.projWeaponTrails.get(id);
+        if (ribbon) { ribbon.stop(); this.projWeaponTrails.delete(id); }
         this.projHistory.delete(id);
       }
     }
@@ -1954,9 +1996,49 @@ export class CarrierGame {
     this.camera.updateProjectionMatrix();
   }
 
-  private spawnExplosion(x: number, y: number, z: number, big = false): void {
+  /** Client-side knockback mirroring server `applyExplosionForce` on the piloted hull. */
+  private applyExplosionKick(cx: number, cy: number, cz: number, radius: number): void {
+    const ceid = this.controlledEntityId;
+    if (!ceid) return;
+    const auth = this.latestEntities.get(ceid);
+    if (!auth || !auth.alive) return;
+    const dx = auth.px - cx;
+    const dy = auth.py - cy;
+    const dz = auth.pz - cz;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    const r = Math.max(1, radius);
+    if (d2 >= r * r || d2 < 1e-6) return;
+    const d = Math.sqrt(d2);
+    const t = 1 - d / r;
+    const impulse = EXPLOSION.peakImpulse * (EXPLOSION.edgeFalloff + (1 - EXPLOSION.edgeFalloff) * t * t);
+    const inv = impulse / d;
+    this.self.vx += dx * inv;
+    this.self.vy += dy * inv;
+    this.self.vz += dz * inv;
+  }
+
+  private spawnExplosion(
+    x: number,
+    y: number,
+    z: number,
+    big = false,
+    splashRadius: number = MISSILE.splashRadius,
+  ): void {
     const pos = new THREE.Vector3(x, y, z);
-    this.vfx?.play("explosion", pos, { scale: big ? 1.4 : 0.85, ttl: big ? 900 : 600 });
+    this.vfx?.play("explosion", pos, { scale: big ? 1.6 : 0.95, ttl: big ? 950 : 650 });
+    this.vfx?.shockwave(pos, {
+      color: "#ff6622",
+      radius: splashRadius * 0.55,
+      duration: 0.55,
+    });
+    const aoeMat = new THREE.MeshBasicMaterial({
+      color: 0xff8844, transparent: true, opacity: 0.35,
+      depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+    });
+    const aoe = new THREE.Mesh(new THREE.SphereGeometry(splashRadius, 20, 14), aoeMat);
+    aoe.position.copy(pos);
+    this.scene.add(aoe);
+
     const mat = new THREE.MeshBasicMaterial({ color: 0xff6622, transparent: true, opacity: 0.9 });
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(SCALE.ship.miner * (big ? 1.6 : 1), 10, 10),
@@ -1969,9 +2051,19 @@ export class CarrierGame {
     const tick = () => {
       if (this.disposed) return;
       const t = (performance.now() - born) / dur;
-      if (t >= 1) { this.scene.remove(mesh); mesh.geometry.dispose(); mat.dispose(); return; }
+      if (t >= 1) {
+        this.scene.remove(mesh);
+        mesh.geometry.dispose();
+        mat.dispose();
+        this.scene.remove(aoe);
+        aoe.geometry.dispose();
+        aoeMat.dispose();
+        return;
+      }
       mesh.scale.setScalar(1 + t * (big ? 18 : 12));
       mat.opacity = 0.9 * (1 - t);
+      aoeMat.opacity = 0.35 * (1 - t);
+      aoe.scale.setScalar(0.35 + t * 0.85);
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
@@ -2652,6 +2744,7 @@ function applyOrientation(group: THREE.Object3D, yaw: number, pitch: number, rol
 const _ba = new THREE.Vector3();
 const _bb = new THREE.Vector3();
 const _bdir = new THREE.Vector3();
+const _btail = new THREE.Vector3();
 const _bup = new THREE.Vector3(0, 1, 0);
 const _bquat = new THREE.Quaternion();
 const _spinQ = new THREE.Quaternion();

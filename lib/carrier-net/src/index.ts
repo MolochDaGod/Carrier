@@ -1,5 +1,6 @@
 /** Public barrel for the Carrier game netcode. */
 export * from "./types";
+export * from "./colliders";
 export * from "./sim";
 export * from "./protocol";
 export * from "./rng";

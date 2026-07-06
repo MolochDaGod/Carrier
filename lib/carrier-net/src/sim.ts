@@ -9,12 +9,13 @@
  * client.  `fleetIntent` runs SERVER-ONLY (clients only interpolate fleet units)
  * but is kept pure + deterministic so the simulation is reproducible.
  */
+import { collideRadius } from "./colliders";
 import {
   CELESTIAL,
   COLLISION,
   ESCORT,
+  EXPLOSION,
   SHIP,
-  SHIP_COLLIDE_RADIUS,
   armorFor,
   fleetRoleDef,
   forwardVec,
@@ -27,6 +28,8 @@ import {
   type Obstacle,
   type ShipState,
 } from "./types";
+
+export { collideRadius } from "./colliders";
 
 const clamp = (v: number, lo: number, hi: number) =>
   v < lo ? lo : v > hi ? hi : v;
@@ -228,7 +231,7 @@ export function resolveCelestialPenetration(
   let contact: { px: number; py: number; pz: number } | null = null;
   for (const b of bodies) {
     const dx = s.px - b.px, dy = s.py - b.py, dz = s.pz - b.pz;
-    const minD = b.radius + SHIP_COLLIDE_RADIUS;
+    const minD = b.radius + collideRadius(s);
     const d2 = dx * dx + dy * dy + dz * dz;
     if (d2 >= minD * minD) continue;
     const d = d2 > 1e-6 ? Math.sqrt(d2) : 1e-3;
@@ -275,14 +278,35 @@ export function damageEntity(e: EntityState, amount: number): number {
   return rem;
 }
 
-/** Physical collision radius (m) for an entity kind/role. */
-export function collideRadius(e: EntityState): number {
-  if (e.kind === "mother_ship") return 120;
-  if (e.kind === "fleet_unit") {
-    const def = fleetRoleDef(e.role);
-    return def ? Math.max(SHIP_COLLIDE_RADIUS, def.scale * 0.6) : SHIP_COLLIDE_RADIUS;
+/**
+ * Apply radial knockback from a detonation. Mutates entity velocities in place.
+ * Falloff is quadratic from centre → edge; skips entities outside `radius`.
+ */
+export function applyExplosionForce(
+  ships: Iterable<EntityState>,
+  cx: number,
+  cy: number,
+  cz: number,
+  radius: number,
+  peak = EXPLOSION.peakImpulse,
+): void {
+  const r = Math.max(1, radius);
+  const r2 = r * r;
+  for (const s of ships) {
+    if (!s.alive) continue;
+    const dx = s.px - cx;
+    const dy = s.py - cy;
+    const dz = s.pz - cz;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 >= r2 || d2 < 1e-6) continue;
+    const d = Math.sqrt(d2);
+    const t = 1 - d / r;
+    const impulse = peak * (EXPLOSION.edgeFalloff + (1 - EXPLOSION.edgeFalloff) * t * t);
+    const inv = impulse / d;
+    s.vx += dx * inv;
+    s.vy += dy * inv;
+    s.vz += dz * inv;
   }
-  return SHIP_COLLIDE_RADIUS;
 }
 
 /** Relative collision mass (heavier hulls shove lighter ones aside). */

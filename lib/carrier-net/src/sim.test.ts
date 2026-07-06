@@ -3,7 +3,9 @@ import {
   CARRIER,
   COLLISION,
   ESCORT,
+  EXPLOSION,
   FLEET_ROLES,
+  MISSILE,
   SHIP,
   MOTHER_SHIP,
   FLEET_UNIT,
@@ -32,6 +34,7 @@ import {
 import { makeRng } from "./rng";
 import { decodeClient } from "./protocol";
 import {
+  applyExplosionForce,
   damageEntity,
   escortIntent,
   fleetIntent,
@@ -40,6 +43,7 @@ import {
   type EscortContext,
   type FleetContext,
 } from "./sim";
+import { colliderExtents, colliderDistance } from "./colliders";
 
 const cmd = (over: Partial<InputCommand> = {}): InputCommand => ({
   seq: 0,
@@ -346,6 +350,51 @@ function fighterAt(
 ): EntityState {
   return spawnEntity(id, id, "fighter", owner, team, 0, px, py, pz, 0);
 }
+
+describe("applyExplosionForce — AOE knockback", () => {
+  it("pushes nearby hulls outward with quadratic falloff", () => {
+    const near = fighterAt("n", "p1", 0, 10, 0, 0);
+    const far = fighterAt("f", "p2", 1, MISSILE.splashRadius + 5, 0, 0);
+    const dead = fighterAt("d", "p3", 2, 5, 0, 0);
+    dead.alive = false;
+    applyExplosionForce([near, far, dead], 0, 0, 0, MISSILE.splashRadius);
+    expect(Math.hypot(near.vx, near.vy, near.vz)).toBeGreaterThan(0);
+    expect(Math.hypot(far.vx, far.vy, far.vz)).toBe(0);
+    expect(Math.hypot(dead.vx, dead.vy, dead.vz)).toBe(0);
+    const t = 1 - 10 / MISSILE.splashRadius;
+    const expected =
+      EXPLOSION.peakImpulse * (EXPLOSION.edgeFalloff + (1 - EXPLOSION.edgeFalloff) * t * t);
+    expect(near.vx).toBeCloseTo(expected, 4);
+  });
+
+  it("is deterministic for identical inputs", () => {
+    const mk = () => [fighterAt("a", "p1", 0, 20, 0, 0), fighterAt("b", "p2", 1, -15, 5, 0)];
+    const x = mk();
+    const y = mk();
+    applyExplosionForce(x, 0, 0, 0, 40);
+    applyExplosionForce(y, 0, 0, 0, 40);
+    expect(deepEqual(x[0], y[0])).toBe(true);
+    expect(deepEqual(x[1], y[1])).toBe(true);
+  });
+});
+
+describe("colliders — convex ellipsoid hulls", () => {
+  it("assigns larger extents to motherships than fighters", () => {
+    const mother = spawnEntity("m", "M", "mother_ship", "p", 0, 0, 0, 0, 0, 0);
+    const fighter = spawnShip("p", "P", 0, 0, 0, 0, 0);
+    const me = colliderExtents(mother);
+    const fe = colliderExtents(fighter);
+    expect(me.hz).toBeGreaterThan(fe.hz);
+    expect(me.hx).toBeGreaterThan(fe.hx);
+  });
+
+  it("reports inside/outside via normalised ellipsoid distance", () => {
+    const fighter = spawnShip("p", "P", 0, 0, 0, 0, 0);
+    expect(colliderDistance(fighter, fighter.px, fighter.py, fighter.pz)).toBe(0);
+    expect(colliderDistance(fighter, fighter.px + 3, fighter.py, fighter.pz)).toBeLessThan(1);
+    expect(colliderDistance(fighter, fighter.px + 30, fighter.py, fighter.pz)).toBeGreaterThan(1);
+  });
+});
 
 describe("resolveShipCollisions — separation, bounce, hostile grind", () => {
   it("is pure/deterministic: identical inputs yield identical post-state", () => {
