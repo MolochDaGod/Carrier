@@ -185,7 +185,22 @@ async function loadGLTF(entry: AssetEntry): Promise<LoadedModel> {
   const loader = new GLTFLoader(makeManager(url));
   const gltf = await loader.loadAsync(url);
   const scene = gltf.scene as unknown as Group;
+  // Some GLBs ship without embedded maps; apply sibling atlases when present.
+  const needsExternalMaps = !sceneHasColorMaps(scene);
+  if (needsExternalMaps && entry.textureUrls.length > 0) {
+    await applyTextures(scene, entry, false);
+  }
   return { scene, animations: gltf.animations, metrics: measure(scene) };
+}
+
+function sceneHasColorMaps(root: Group): boolean {
+  let found = false;
+  root.traverse((node) => {
+    if (found || !(node instanceof Mesh)) return;
+    const mats = materialsOf(node);
+    if (mats.some((m) => (m as MeshStandardMaterial).map)) found = true;
+  });
+  return found;
 }
 
 async function loadFBX(entry: AssetEntry): Promise<LoadedModel> {

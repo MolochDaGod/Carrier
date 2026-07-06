@@ -92,6 +92,7 @@ export function MothershipSelect({
         showcase.select(
           MOTHERSHIPS[shipTypeRef.current] ?? MOTHERSHIPS[0],
           FACTION_ACCENT[faction] ?? factionDef.color,
+          faction,
         );
         // Reapply any custom models saved on a previous visit.
         await showcase.loadPersistedOverrides();
@@ -108,10 +109,10 @@ export function MothershipSelect({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Swap the displayed hull when the hull OR the faction tint changes.
+  // Swap the displayed hull when the hull, faction, or tint changes.
   useEffect(() => {
-    if (ready) showcaseRef.current?.select(def, accent);
-  }, [ready, def, accent]);
+    if (ready) showcaseRef.current?.select(def, accent, faction);
+  }, [ready, def, accent, faction]);
 
   // Review mode: auto-advance through all six hulls so the player can cycle the
   // whole roster hands-free; any manual pick keeps the latest in shipTypeRef.

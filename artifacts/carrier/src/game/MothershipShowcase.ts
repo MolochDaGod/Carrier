@@ -23,7 +23,10 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import type { FactionId } from "@workspace/carrier-net";
 import { loadAsset, type LoadedModel } from "@workspace/assets";
+import { DEPLOY_ROLES, fleetModelFor } from "./factionAssets";
+import { disposeGroup, loadShowcaseHull } from "./hullFactory";
 import { MOTHERSHIPS, type MothershipDef, type TurretMount } from "./motherships";
 import {
   validateModelFile,
@@ -36,9 +39,9 @@ import {
 const PLATFORM_ID = "environment/carrier/cyberpunk-platform-b";
 const TURRET_GUN_ID = "props/carrier/turret-gun";
 const TURRET_CANNON_ID = "props/carrier/turret-cannon";
-/** Distinct per-class hull GLBs (one per mothership), deduped. */
-const HULL_IDS = [...new Set(MOTHERSHIPS.map((m) => m.hull))];
 const TURRET_IDS = [TURRET_GUN_ID, TURRET_CANNON_ID] as const;
+/** Hangar hero is the faction's own deployable hull — no shared dock platform. */
+const SHOW_PLATFORM = false;
 
 /**
  * Target longest-side fits (arbitrary preview units). The HULL is the hero, the
@@ -71,7 +74,8 @@ export class MothershipShowcase {
   /** User-uploaded replacement scenes by asset id (owned; fully disposed). */
   private overrides: Record<string, THREE.Object3D> = {};
   /** The currently displayed selection, so uploads can rebuild in place. */
-  private current: { def: MothershipDef; accent: string } | null = null;
+  private current: { def: MothershipDef; accent: string; faction: FactionId } | null = null;
+  private buildSeq = 0;
   private ready = false;
   private raf = 0;
   private disposed = false;
@@ -137,7 +141,7 @@ export class MothershipShowcase {
 
   /** Load the shared composition assets. Safe to call once; resolves when ready. */
   async init(): Promise<void> {
-    const ids = [PLATFORM_ID, ...HULL_IDS, ...TURRET_IDS];
+    const ids = [PLATFORM_ID, ...TURRET_IDS];
     const loaded = await Promise.all(
       ids.map(async (id) => {
         try {
@@ -177,10 +181,10 @@ export class MothershipShowcase {
    * emissive trim, so switching faction visibly refreshes the showcase even when
    * the same hull stays selected.
    */
-  select(def: MothershipDef, accent?: string): void {
+  select(def: MothershipDef, accent?: string, faction: FactionId = "scavengers"): void {
     if (this.disposed) return;
-    this.current = { def, accent: accent ?? def.accent };
-    this.rebuild();
+    this.current = { def, accent: accent ?? def.accent, faction };
+    void this.rebuildAsync();
   }
 
   /**
@@ -209,7 +213,7 @@ export class MothershipShowcase {
       }
       const prev = this.overrides[id];
       this.overrides[id] = gltf.scene;
-      this.rebuild();
+      void this.rebuildAsync();
       if (prev) disposeOwned(prev);
     } finally {
       URL.revokeObjectURL(url);
@@ -248,7 +252,7 @@ export class MothershipShowcase {
         URL.revokeObjectURL(url);
       }
     }
-    if (changed && this.current) this.rebuild();
+    if (changed && this.current) void this.rebuildAsync();
   }
 
   /**
@@ -261,7 +265,7 @@ export class MothershipShowcase {
     const prev = this.overrides[id];
     if (prev) {
       delete this.overrides[id];
-      this.rebuild();
+      void this.rebuildAsync();
       disposeOwned(prev);
     }
     await deleteOverride(id);
@@ -273,10 +277,16 @@ export class MothershipShowcase {
   }
 
   /** Resolve the catalog/override asset id backing a swappable slot. */
+  private activeHullId(): string {
+    if (!this.current) return MOTHERSHIPS[0].hull;
+    const role = DEPLOY_ROLES[this.current.def.id] ?? DEPLOY_ROLES[0];
+    return fleetModelFor(this.current.faction, role).id;
+  }
+
   private slotId(slot: ShowcaseSlot): string {
     switch (slot) {
       case "hull":
-        return this.current?.def.hull ?? HULL_IDS[0];
+        return this.activeHullId();
       case "platform":
         return PLATFORM_ID;
       case "turret-gun":
@@ -288,12 +298,26 @@ export class MothershipShowcase {
 
   // --- composition ----------------------------------------------------------
 
-  private rebuild(): void {
+  private async rebuildAsync(): Promise<void> {
     if (!this.current) return;
-    const { def } = this.current;
+    const { def, faction } = this.current;
+    const mySeq = ++this.buildSeq;
     const accent = new THREE.Color(this.current.accent);
     this.accentLightA.color.copy(accent).lerp(new THREE.Color(0xffffff), 0.25);
     this.accentLightB.color.copy(accent).lerp(new THREE.Color(0xffffff), 0.25);
+
+    const role = DEPLOY_ROLES[def.id] ?? DEPLOY_ROLES[0];
+    const shipModel = fleetModelFor(faction, role);
+    let hull: THREE.Object3D | null = null;
+    try {
+      hull = await loadShowcaseHull(shipModel, faction, HULL_FIT * def.hullScale);
+    } catch {
+      hull = null;
+    }
+    if (this.disposed || mySeq !== this.buildSeq) {
+      if (hull) disposeGroup(hull);
+      return;
+    }
 
     if (this.composite) {
       this.rig.remove(this.composite);
@@ -305,40 +329,38 @@ export class MothershipShowcase {
 
     const group = new THREE.Group();
 
-    // Smaller platform base, sitting on the floor (y=0).
     let platformTop = 0;
-    const platform = this.cloneFit(PLATFORM_ID, PLATFORM_FIT * def.hullScale, accent, 0.16);
-    if (platform) {
-      group.add(platform);
-      platform.updateMatrixWorld(true);
-      platformTop = new THREE.Box3().setFromObject(platform).max.y;
+    let platformR = (PLATFORM_FIT * def.hullScale) / 2;
+    if (SHOW_PLATFORM) {
+      const platform = this.cloneFit(PLATFORM_ID, PLATFORM_FIT * def.hullScale, accent, 0.16);
+      if (platform) {
+        group.add(platform);
+        platform.updateMatrixWorld(true);
+        platformTop = new THREE.Box3().setFromObject(platform).max.y;
+        platformR = (PLATFORM_FIT * def.hullScale) / 2;
+      }
     }
-    const platformR = (PLATFORM_FIT * def.hullScale) / 2;
 
-    // Hull — the HERO — floating above the platform. Each class has its OWN hull.
-    const hull = this.cloneFit(def.hull, HULL_FIT * def.hullScale, accent, 0.12);
     if (hull) {
-      hull.position.y += platformTop + HULL_FIT * def.hullScale * 0.12;
+      if (SHOW_PLATFORM) {
+        hull.position.y += platformTop + HULL_FIT * def.hullScale * 0.12;
+      }
       group.add(hull);
-    }
-
-    // Tiny turret fixtures arranged around the platform rim.
-    const mounts = def.turrets;
-    mounts.forEach((mount, i) => {
-      const turret = this.cloneTurret(mount, def.hullScale);
-      if (!turret) return;
-      const ang = (i / Math.max(1, mounts.length)) * Math.PI * 2 + Math.PI / 4;
-      const r = platformR * 0.72;
-      turret.position.set(Math.cos(ang) * r, platformTop, Math.sin(ang) * r);
-      group.add(turret);
-    });
-
-    if (group.children.length === 0) {
+    } else {
       group.add(makeFallbackHull(accent, def.hullScale));
     }
 
-    // Recentre the composite on the origin so it frames + spins cleanly, then
-    // frame the camera to the whole bounding sphere (hull stays the focus).
+    if (SHOW_PLATFORM) {
+      def.turrets.forEach((mount, i) => {
+        const turret = this.cloneTurret(mount, def.hullScale);
+        if (!turret) return;
+        const ang = (i / Math.max(1, def.turrets.length)) * Math.PI * 2 + Math.PI / 4;
+        const r = platformR * 0.72;
+        turret.position.set(Math.cos(ang) * r, platformTop, Math.sin(ang) * r);
+        group.add(turret);
+      });
+    }
+
     group.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(group);
     const center = new THREE.Vector3();

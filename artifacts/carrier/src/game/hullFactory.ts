@@ -118,8 +118,50 @@ export function tintMetalHull(
   });
 }
 
+/**
+ * Hangar / showcase hull: full PBR textures from the asset pipeline, subtle
+ * faction emissive trim only (no flat metal wash).
+ */
+export async function loadShowcaseHull(
+  model: ShipModel,
+  faction: FactionId,
+  fit: number,
+): Promise<THREE.Object3D> {
+  await ensureOverridesPrimed();
+  const override = getOverrideTemplate(model.id);
+  const src = override ?? (await loadAsset(model.id) as LoadedModel).scene;
+  const clone = src.clone(true);
+  if (model.yaw === undefined) autoOrientShip(clone);
+  else clone.rotation.y = model.yaw;
+  applyShowcaseAccent(clone, new THREE.Color(FACTION_ACCENT[faction]));
+  fitObject(clone, fit);
+  return clone;
+}
+
+/** Clone materials so `.map` / normal / roughness survive; add muted rim emissive. */
+function applyShowcaseAccent(root: THREE.Object3D, accent: THREE.Color): void {
+  root.traverse((o) => {
+    if (!(o instanceof THREE.Mesh)) return;
+    o.userData.sharedGeo = true;
+    const src = Array.isArray(o.material) ? o.material : [o.material];
+    const next = src.map((mm) => {
+      const base = mm as THREE.MeshStandardMaterial;
+      const m = base.clone();
+      m.emissive = accent.clone();
+      m.emissiveIntensity = 0.12;
+      m.envMapIntensity = 1.15;
+      if (m.map) m.color.setHex(0xffffff);
+      return m;
+    });
+    o.material = Array.isArray(o.material) ? next : next[0];
+  });
+}
+
 /** Recentre an object on its bounding-box centre and scale so its longest axis = fit. */
 export function fitObject(obj: THREE.Object3D, fit: number): void {
+  // Baked child scales (e.g. platform GLB nodes at 100×) must be in world space
+  // before measuring, or fit computes a wildly wrong scale factor.
+  obj.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(obj);
   const size = new THREE.Vector3();
   const center = new THREE.Vector3();

@@ -96,7 +96,7 @@ function buildCatalog(): AssetEntry[] {
     const subgroup = subgroupParts.length > 0 ? subgroupParts.join("/") : undefined;
     const id = path.replace(/\.[^.]+$/, "");
 
-    const textureUrls = format === "gltf" ? [] : texturesFor(path, texturePaths);
+    const textureUrls = texturesFor(path, texturePaths);
     const animated =
       category === "animations" ||
       (format === "gltf" && ANIMATED_GLTF_CATEGORIES.has(category));
