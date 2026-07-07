@@ -14,9 +14,11 @@ import { type CarrierHudState } from "./constants";
 import { CarrierLanding } from "./CarrierLanding";
 import { CarrierIntroOverlay } from "./CarrierIntroOverlay";
 import { MothershipSelect } from "./MothershipSelect";
-import { mechFor } from "./mechs";
+import { MOTHERSHIPS } from "./motherships";
 
 type Phase = "landing" | "setup" | "playing" | "error";
+
+const SHIP_NAMES = MOTHERSHIPS.map((m) => m.name);
 
 export function CarrierLauncher({ onExit }: { onExit: () => void }) {
   const [phase, setPhase] = useState<Phase>("landing");
@@ -31,11 +33,7 @@ export function CarrierLauncher({ onExit }: { onExit: () => void }) {
   const launchOpts = useRef<{ name: string; shipType: number; faction: FactionId } | null>(null);
 
   const handleLaunch = useCallback(() => {
-    launchOpts.current = {
-      name: name.trim() || mechFor(shipType).name,
-      shipType,
-      faction,
-    };
+    launchOpts.current = { name: name.trim() || SHIP_NAMES[shipType], shipType, faction };
     setIntro(true);
     setPhase("playing");
   }, [name, shipType, faction]);
@@ -98,7 +96,7 @@ export function CarrierLauncher({ onExit }: { onExit: () => void }) {
   }
 
   const factionDef = FACTIONS[faction] ?? FACTIONS[FACTION_ORDER[0]];
-  const introDef = mechFor(shipType);
+  const introDef = MOTHERSHIPS[shipType] ?? MOTHERSHIPS[0];
 
   return (
     <div className="fixed inset-0 overflow-hidden bg-black">

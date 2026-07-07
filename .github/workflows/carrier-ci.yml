@@ -1,0 +1,57 @@
+# Verify Carrier monorepo on every push; Railway auto-deploys main via Dockerfile.
+name: Carrier CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: carrier-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: carrier-net unit tests
+        run: pnpm --filter @workspace/carrier-net exec vitest run
+
+      - name: Build API server
+        env:
+          NODE_ENV: production
+          PORT: "8080"
+          BASE_PATH: /
+        run: pnpm --filter @workspace/api-server run build
+
+      - name: Build Carrier client
+        env:
+          NODE_ENV: production
+          PORT: "21529"
+          BASE_PATH: /
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: pnpm --filter @workspace/carrier run build
+
+      - name: Verify universe client bundle
+        run: |
+          APP=$(ls artifacts/carrier/dist/public/assets/App-*.js | head -1)
+          grep -q universeEvent "$APP"
+          grep -q solarSystem "$APP"
+          echo "✓ $APP contains universe client markers"

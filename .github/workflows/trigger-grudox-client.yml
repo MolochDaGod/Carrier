@@ -1,0 +1,22 @@
+# After Carrier client/net changes land on main, tell grudox to rebuild carrier-host.
+name: Trigger grudox carrier client
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "artifacts/carrier/**"
+      - "lib/carrier-net/**"
+      - "lib/assets/**"
+      - "pnpm-lock.yaml"
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch grudox rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GH_PAT }}
+          repository: MolochDaGod/grudox
+          event-type: rebuild-carrier-client
