@@ -123,6 +123,9 @@ export interface DeployOption {
   available: boolean;
 }
 
+/** Hull render phase for a deployed fleet unit (wired via fleetDebug). */
+export type FleetHullPhase = "pending" | "glb" | "fallback" | "error";
+
 /** One owned fleet unit in the roster list. */
 export interface FleetRow {
   id: string;
@@ -131,6 +134,43 @@ export interface FleetRow {
   hpPct: number;
   /** Deflector charge fraction (0..1); 0 when the unit has no shield. */
   shieldPct: number;
+  /** GLB load phase — visible when fleet debug is on or hull is not GLB. */
+  hullPhase: FleetHullPhase;
+  hullAssetId: string;
+  hullError?: string;
+}
+
+/** One line in the fleet debug panel. */
+export interface FleetDebugRow {
+  key: string;
+  label: string;
+  assetId: string;
+  phase: FleetHullPhase;
+  attempts: number;
+  skinned: boolean;
+  durationMs?: number;
+  error?: string;
+  source: string;
+}
+
+export interface FleetDebugPanel {
+  enabled: boolean;
+  rows: FleetDebugRow[];
+  pending: number;
+  glb: number;
+  fallback: number;
+  error: number;
+  /** Global @workspace/assets load queue (bounded concurrency). */
+  loadQueue: {
+    maxConcurrency: number;
+    inFlight: number;
+    queued: number;
+    completed: number;
+    failed: number;
+  };
+  /** Hangar/match asset warmup tier. */
+  warmupPhase: string;
+  cdn: boolean;
 }
 
 /** One controllable unit (carrier / fighter / fleet unit) in the command roster. */
@@ -151,7 +191,7 @@ export interface RosterRow {
   /** Whether this unit is currently flying escort on the commander (optimistic). */
   escorting: boolean;
   /** True for the commander's mothership row. */
-  isMother: boolean;
+  isMother?: boolean;
 }
 
 /** One build-platform option in the command UI. */
@@ -177,8 +217,27 @@ export interface MapBlip {
   x: number;
   /** Projected map Y (from world Z). */
   y: number;
-  kind: "self" | "carrier" | "fleet" | "platform" | "enemy" | "reward" | "rock" | "outpost";
+  kind: "self" | "carrier" | "fleet" | "platform" | "enemy" | "reward" | "rock" | "outpost" | "system";
   color: string;
+  /** World entity / celestial id (for map click → navigate). */
+  id?: string;
+  /** Short label for mission targets. */
+  label?: string;
+  /** Highlight as a clickable mission objective. */
+  mission?: boolean;
+}
+
+/** Mothership strategic state surfaced in the HUD. */
+export interface MotherMissionState {
+  /** Active map course, if any. */
+  navActive: boolean;
+  navLabel?: string;
+  /** Claimed asteroid id (mothership acts as rock node). */
+  claimedRockId?: string | null;
+  /** True when the carrier is within mining range of its rock node. */
+  atRockNode: boolean;
+  /** 0..1 progress on fabricating one level-1 craft. */
+  produceProgress: number;
 }
 
 /** A HUD "ping": an AI mining outpost the local commander can fly to + contest. */
@@ -262,12 +321,18 @@ export interface CarrierHudState {
   cinematic: boolean;
   /** Active onboarding tutorial prompt, or null when not training / finished. */
   hint: TutorialHint | null;
-  /** Pointer lock engaged — combat crosshair is active. */
-  aiming: boolean;
-  /** LMB / primary held this frame. */
-  firingPrimary: boolean;
-  /** RMB / missile held this frame. */
-  firingMissile: boolean;
+  /** Wired fleet hull diagnostics (`?fleetDebug` or backtick toggle). */
+  fleetDebug: FleetDebugPanel;
+  /** Screen-space aim point (0..1); null when off-screen / not aiming. */
+  aimScreen: { x: number; y: number } | null;
+  /** Mothership rock-node missions + production. */
+  motherMission: MotherMissionState;
+  /** Live hull-yaw tune for the controlled ship (degrees); null when idle. */
+  hullTuneDeg: number | null;
+  /** Brief save confirmation after numpad 5. */
+  hullTuneSaved: string | null;
+  /** Latest server universe event banner (macro drift, comet surge, etc.). */
+  universeEvent: { kind: string; msg: string } | null;
 }
 
 /** Mothership camera modes: chase-flight, orbit/survey, free-fly, and the opening cinematic. */

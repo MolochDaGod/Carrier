@@ -14,15 +14,20 @@
  */
 import * as THREE from "three";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
-import { loadAsset, type LoadedModel } from "@workspace/assets";
-import { VfxManager, type TrailHandle, type VfxHandle } from "@workspace/vfx";
 import {
-  FIGHTER_GLB,
+  getLoadQueueStats,
+  loadAsset,
+  preloadAssets,
+  type LoadedModel,
+} from "@workspace/assets";
+import { VfxManager, type VfxHandle } from "@workspace/vfx";
+import {
   fleetModelFor,
   type DeployRole,
   type ShipModel,
 } from "./factionAssets";
-import { attachThrusters, updateThrusterSet } from "./thrusters";
+import { spawnShellFor } from "./factionShips";
+import { attachThrusters, repositionThrustersFromHull, updateThrusterSet } from "./thrusters";
 import {
   BOSS,
   CARRIER,
@@ -32,14 +37,14 @@ import {
   FACTION_ORDER,
   FLEET_ROLES,
   FLEET_UNIT,
-  EXPLOSION,
-  MISSILE,
   MOTHER_SHIP,
   PLATFORM,
   PLATFORM_DEFS,
   PLATFORM_KINDS,
   SHIP,
   fleetRoleDef,
+  fleetRoleDefFor,
+  platformDefFor,
   forwardVec,
   motherTurretVisualCount,
   spawnShip,
@@ -81,7 +86,6 @@ import {
 } from "./constants";
 import { SUN, sunPosition, SCALE } from "./scale";
 import { FACTION_ACCENT } from "./motherships";
-import { clampMechType, mechModelFor } from "./mechs";
 import {
   disposeGroup,
   fitObject,
@@ -90,8 +94,15 @@ import {
   stationFit,
 } from "./hullFactory";
 import { disposeHullOverrides } from "./hullOverrides";
+import { hullAssetIdFor } from "./hullAssetId";
+import { getHullYawTune, saveHullYawTune } from "./hullYawStore";
+import { fleetDebug } from "./fleetDebug";
+import { MATCH_SHARED_ASSETS } from "./factionAssetManifest";
+import {
+  getWarmupState,
+  warmupFactionAssets,
+} from "./factionAssetWarmup";
 import { CarrierSocket } from "./net";
-import { sampleHullTurretMounts } from "./motherTurretMounts";
 import { Turret } from "./Turret";
 
 interface SnapEntry {
@@ -102,6 +113,8 @@ interface SnapEntry {
 
 /** Duration (seconds) of the opening fly-around cinematic. */
 const CINEMATIC_DUR = 7;
+/** Per keypress hull yaw step (radians) — numpad 4 / 6. */
+const HULL_YAW_STEP = Math.PI / 36;
 
 /**
  * Flight-training onboarding shown after the cinematic. Each step displays a
@@ -208,10 +221,8 @@ export class CarrierGame {
   private latestEconomy: PlayerEconomy[] = [];
 
   private projs = new Map<number, ProjectileState>();
-  private projMeshes = new Map<number, THREE.Mesh>();
+  private projMeshes = new Map<number, THREE.Object3D>();
   private projTrails = new Map<number, VfxHandle>();
-  /** Swept ribbon trails for homing missiles (VFX spline). */
-  private projWeaponTrails = new Map<number, TrailHandle>();
   /** Position history for spline missile trails (id → recent world points). */
   private projHistory = new Map<number, THREE.Vector3[]>();
   private projSplines = new Map<number, THREE.Line>();
@@ -261,6 +272,9 @@ export class CarrierGame {
   /** Lazy-loaded Lootbox GLB used as the reward-cache pickup; null until loaded. */
   private lootboxTpl: THREE.Object3D | null = null;
   private lootboxReq = false;
+  /** Asteroid rock meshes (props/rock1 + rock2); procedural icosa until loaded. */
+  private rockTpls: [THREE.Object3D | null, THREE.Object3D | null] = [null, null];
+  private rockReq = false;
 
   // AI mining outposts (the contestable "ping" objectives).
   private latestOutposts: Outpost[] = [];
@@ -285,8 +299,18 @@ export class CarrierGame {
   private explosionTemplate: THREE.Object3D | null = null;
   private explosionLoading = false;
 
-  // Distant set-pieces (black-hole + solar-system backdrops).
+  /** Player homing missile (Missile.glb); AurynSky rockets for auto/turret salvos. */
+  private missileTpl: THREE.Object3D | null = null;
+  private aurynRocketTpls: (THREE.Object3D | null)[] = Array(9).fill(null);
+  private missileReq = false;
+
+  // Distant set-pieces (black-hole backdrop).
   private backdrops: THREE.Object3D[] = [];
+  /** Solar-system GLB template for server-placed planet nodes. */
+  private solarSystemTpl: THREE.Object3D | null = null;
+  private solarSystemReq = false;
+  /** Latest server universe event for the HUD banner. */
+  private universeEvent: { kind: string; msg: string; at: number } | null = null;
 
   private keys = new Set<string>();
   /** 0 = LMB primary, 2 = RMB missile. */
@@ -295,6 +319,21 @@ export class CarrierGame {
   private mouseDy = 0;
   private pointerLocked = false;
   private invertY = false;
+  /** Screen-normalized aim point (0..1) projected from ship nose; drives HUD reticle. */
+  private aimScreen: { x: number; y: number } | null = null;
+  /** Strategic mothership state from the latest economy snapshot. */
+  private motherMission = {
+    navActive: false,
+    navLabel: undefined as string | undefined,
+    claimedRockId: null as string | null | undefined,
+    atRockNode: false,
+    produceProgress: 0,
+  };
+  /** Degrees shown in HUD while tuning hull yaw with the numpad. */
+  private hullTuneHudDeg: number | null = null;
+  /** Toast after numpad 5 save (cleared after a few seconds). */
+  private hullTuneSavedMsg: string | null = null;
+  private hullTuneSavedAt = 0;
 
   // Mothership camera modes (client-only): "follow" chase-flight (default),
   // "orbit" survey (ship parked, camera orbits the hull with vantage presets),
@@ -361,6 +400,16 @@ export class CarrierGame {
   }
 
   start(): void {
+    const faction = this.opts.faction ?? FACTION_ORDER[0];
+    const ws = getWarmupState();
+    if (ws.faction !== faction || ws.phase !== "done") {
+      void warmupFactionAssets(faction);
+    }
+    void preloadAssets([...MATCH_SHARED_ASSETS], {
+      concurrency: 2,
+      continueOnError: true,
+    });
+
     // The self mesh tracks whichever hull the commander is piloting (any owned
     // entity via become — fighter, carrier, or fleet unit).
     this.socket.onStatus = (s) => { this.status = s; };
@@ -369,12 +418,7 @@ export class CarrierGame {
       // Fighter entity id === player id by convention; authoritative control id
       // arrives on the first snapshot — seed last-piloted for Tab toggle.
       this.lastPilotedId = m.id;
-      this.socket.send({
-        t: "join",
-        name: this.opts.name,
-        shipType: clampMechType(this.opts.shipType),
-        faction: this.opts.faction,
-      });
+      this.socket.send({ t: "join", name: this.opts.name, shipType: this.opts.shipType, faction: this.opts.faction });
     };
     this.socket.onSnapshot = (m) => this.onSnapshot(m);
     this.socket.connect();
@@ -408,9 +452,9 @@ export class CarrierGame {
     this.scene.add(this.sunBillboard);
 
     // Stars — three depth layers, vertex-coloured for variety.
-    this.scene.add(this.makeStars(3500, SHIP.arena * 3));
-    this.scene.add(this.makeStars(1200, SHIP.arena * 1.8));
-    this.scene.add(this.makeStars(500, SHIP.arena * 1.1));
+    this.scene.add(this.makeStars(4500, SHIP.arena * 4.2));
+    this.scene.add(this.makeStars(1800, SHIP.arena * 2.4));
+    this.scene.add(this.makeStars(700, SHIP.arena * 1.35));
 
     // Deep-space nebula gradient enveloping the arena (adds depth + colour).
     this.addNebula();
@@ -437,6 +481,7 @@ export class CarrierGame {
     // are no-ops until ready, so spawning before load simply skips the effect.
     this.vfx = new VfxManager(this.scene);
     this.vfx.load(["fireSparks", "explosion", "muzzleFlash", "projectileTrail"]).catch(() => {});
+    this.ensureMissileTemplates();
   }
 
   /** Load the two environment GLBs once and park them far outside the arena. */
@@ -457,8 +502,17 @@ export class CarrierGame {
         })
         .catch(() => { /* backdrop is decorative — ignore load failures */ });
     };
-    place("environment/carrier/black-hole", [-SHIP.arena * 4, SHIP.arena * 1.6, -SHIP.arena * 5], SHIP.arena * 2.2);
-    place("environment/carrier/solar-system", [SHIP.arena * 5, -SHIP.arena * 1.2, SHIP.arena * 4.5], SHIP.arena * 3);
+    place("environment/carrier/black-hole", [-SHIP.arena * 7, SHIP.arena * 2.2, -SHIP.arena * 8], SHIP.arena * 3.5);
+    this.ensureSolarSystemTemplate();
+  }
+
+  /** Lazy-load solar-system GLB for server-authoritative planet nodes. */
+  private ensureSolarSystemTemplate(): void {
+    if (this.solarSystemReq) return;
+    this.solarSystemReq = true;
+    loadAsset("environment/carrier/solar-system")
+      .then((m: LoadedModel) => { if (!this.disposed) this.solarSystemTpl = m.scene; })
+      .catch(() => { /* icosahedron planet fallback */ });
   }
 
   private makeSunBillboard(sx: number, sy: number, sz: number): THREE.Mesh {
@@ -522,7 +576,7 @@ export class CarrierGame {
     const top = new THREE.Color(0x2a1656);
     const mid = new THREE.Color(0x0e2c5a);
     const warm = new THREE.Color(0x5a2342);
-    const R = SHIP.arena * 3.2;
+    const R = SHIP.arena * 4.5;
     const geo = new THREE.IcosahedronGeometry(R, 4);
     const p = geo.getAttribute("position") as THREE.BufferAttribute;
     const n = p.count;
@@ -622,13 +676,16 @@ export class CarrierGame {
     const faction = entity.faction ?? FACTION_ORDER[0];
     let g: THREE.Group;
     if (entity.kind === "mother_ship") g = this.makeMothership(faction, entity.shipType);
-    else if (entity.kind === "fleet_unit") g = this.makeFleetUnit(entity.role, faction);
+    else if (entity.kind === "fleet_unit") g = this.makeFleetUnit(entity.role, faction, entity.id);
     else g = this.makeFighter(entity, faction);
 
     // Floating in-world identity tag (name + short UID) + deflector bubble. Both
     // ride the hull group; the tag is a billboarded canvas sprite, the shield a
     // translucent additive sphere whose opacity tracks the deflector charge.
     const r = this.hullRadius(entity);
+    g.userData.hullAssetId = hullAssetIdFor(entity);
+    this.syncHullTune(g);
+
     const tag = this.makeNameTag(r * 1.35);
     tag.position.y = r * 1.45;
     g.add(tag);
@@ -719,10 +776,12 @@ export class CarrierGame {
     const fb = this.makeFallbackShip(entity.shipType, isEnemy ? "#ff3b30" : FACTIONS[faction].color);
     g.add(fb);
     g.userData.fallback = fb;
-    const model = isEnemy
-      ? FIGHTER_GLB.enemy
-      : mechModelFor(clampMechType(entity.shipType));
-    this.requestShipModel(g, model, faction, SHIP_FIT);
+    this.requestShipModel(
+      g,
+      isEnemy ? spawnShellFor(faction, "enemy") : spawnShellFor(faction, "player"),
+      faction,
+      SHIP_FIT,
+    );
     // Animated rear boosters on the outer group (survive the async hull swap).
     attachThrusters(g, {
       kind: "fighter",
@@ -751,11 +810,9 @@ export class CarrierGame {
     // client accent (matching the lit hull) so the fixtures read as part of the
     // painted-metal hull instead of glowing neon attachments; the firing beam is
     // brightened back to legible inside the Turret itself.
-    g.userData.turretConfig = { accent: FACTION_ACCENT[faction], shipType, faction };
-    this.motherGroups.add(g);
-    this.tryMountMotherTurrets(g);
-    // Capital boosters fire downward from a belly cluster — matching the engine
-    // "legs" on the faction stations. On the outer group so they survive the swap.
+    this.addMotherTurrets(g, FACTION_ACCENT[faction], shipType, faction);
+    // Capital boosters mount on the hull rear face (re-anchored after station swap)
+    // and trail opposite velocity each frame. On the outer group so they survive swap.
     attachThrusters(g, {
       kind: "mother_ship",
       color: FACTION_ACCENT[faction],
@@ -769,62 +826,78 @@ export class CarrierGame {
   }
 
   /**
-   * Mount animated hull turrets on the loaded station mesh using raycasted
-   * surface points (convex hull sampling) instead of a flat grid in space.
+   * Stud a mothership's upper hull with real animated turrets (the rigged
+   * heavy-metal-turret GLB). They load asynchronously and self-deploy; each
+   * tracks + fires at the nearest hostile every frame (see `updateTurrets`).
+   * The instances are stored on `g.userData.turrets` so their lifecycle is tied
+   * to the (transient) mothership group — `disposeMother` frees them on teardown.
    */
-  private mountMotherTurrets(
-    g: THREE.Group,
-    hull: THREE.Object3D,
-    accent: string,
-    shipType: number,
-    faction: FactionId,
-  ): void {
-    this.clearMotherTurrets(g);
+  private addMotherTurrets(g: THREE.Group, accent: string, shipType: number, faction: FactionId): void {
     const len = stationFit(faction);
     const size = len * 0.048;
     const count = Math.min(10, Math.max(5, Math.round(motherTurretVisualCount(shipType) / 2.5)));
     const turrets: Turret[] = [];
+    const slots: { sx: number; zt: number }[] = [];
     g.userData.turrets = turrets;
+    g.userData.turretSlots = slots;
     g.userData.turretFaction = faction;
+    g.userData.turretAccent = accent;
+    g.userData.turretSize = size;
+    g.userData.turretShipType = shipType;
+    this.motherGroups.add(g);
 
-    const mounts = sampleHullTurretMounts(hull, count);
-    for (const mount of mounts) {
+    const rows = Math.ceil(count / 2);
+    let placed = 0;
+    for (let r = 0; r < rows && placed < count; r++) {
+      const zt = rows === 1 ? 0.5 : r / (rows - 1);
+      for (const sx of [-1, 1]) {
+        if (placed >= count) break;
+        placed++;
+        slots.push({ sx, zt });
+      }
+    }
+    this.spawnMotherTurrets(g);
+  }
+
+  /** Mount or remount hull turrets using the fitted station bounding box. */
+  private spawnMotherTurrets(g: THREE.Group): void {
+    const slots = g.userData.turretSlots as { sx: number; zt: number }[] | undefined;
+    const accent = g.userData.turretAccent as string | undefined;
+    const size = g.userData.turretSize as number | undefined;
+    if (!slots || !accent || !size) return;
+
+    const existing = g.userData.turrets as Turret[] | undefined;
+    if (existing) for (const t of existing) t.dispose();
+    const turrets: Turret[] = [];
+    g.userData.turrets = turrets;
+
+    const hull = (g.userData.glb as THREE.Object3D | undefined) ?? g;
+    const box = new THREE.Box3().setFromObject(hull);
+    const center = new THREE.Vector3();
+    const dims = new THREE.Vector3();
+    box.getCenter(center);
+    box.getSize(dims);
+    const len = Math.max(dims.x, dims.y, dims.z, stationFit(g.userData.turretFaction as FactionId));
+    const up = new THREE.Vector3(0, 1, 0);
+
+    for (const slot of slots) {
+      const pos = new THREE.Vector3(
+        center.x + slot.sx * dims.x * 0.34,
+        box.max.y + len * 0.012,
+        center.z + (slot.zt - 0.5) * dims.z * 0.72,
+      );
       Turret.create({ size, beamColor: accent, range: len * 2.6 })
         .then((t) => {
           if (this.disposed || !this.motherGroups.has(g)) {
             t.dispose();
             return;
           }
-          t.mountOn(g, mount.position, mount.normal);
+          t.mountOn(g, pos, up);
           t.deploy();
           turrets.push(t);
         })
-        .catch(() => { /* hull simply shows no turret there */ });
+        .catch(() => { /* asset failed — hull shows no turret there */ });
     }
-  }
-
-  private clearMotherTurrets(g: THREE.Group): void {
-    const turrets = g.userData.turrets as Turret[] | undefined;
-    if (turrets) {
-      for (const t of turrets) t.dispose();
-      turrets.length = 0;
-    }
-  }
-
-  /** Mount (or remount) turrets once a mothership hull mesh is available. */
-  private tryMountMotherTurrets(g: THREE.Group): void {
-    const cfg = g.userData.turretConfig as
-      | { accent: string; shipType: number; faction: FactionId }
-      | undefined;
-    if (!cfg) return;
-    const hull = (g.userData.glb ?? g.userData.fallback) as THREE.Object3D | undefined;
-    if (!hull) return;
-    const key = hull.uuid;
-    if (g.userData.turretHullKey === key && (g.userData.turrets as Turret[] | undefined)?.length) {
-      return;
-    }
-    g.userData.turretHullKey = key;
-    this.mountMotherTurrets(g, hull, cfg.accent, cfg.shipType, cfg.faction);
   }
 
   /** Free any animated turrets carried by a (mothership) group before disposal. */
@@ -869,16 +942,71 @@ export class CarrierGame {
    * their plume flares exactly when they are boosting instead of being inferred
    * from over-cap speed (which lingered after boost was released).
    */
+  /** Apply saved + live hull-yaw tune to the fitted mesh on `group`. */
+  private syncHullTune(group: THREE.Group): void {
+    const assetId = group.userData.hullAssetId as string | undefined;
+    if (!assetId) return;
+    const hull = (group.userData.glb ?? group.userData.fallback) as THREE.Object3D | undefined;
+    if (!hull) return;
+    const tune = (group.userData.hullTuneYaw as number | undefined) ?? getHullYawTune(assetId);
+    group.userData.hullTuneYaw = tune;
+    if (group.userData.hullBaseYaw === undefined) {
+      group.userData.hullBaseYaw = hull.rotation.y - tune;
+    }
+    const base = group.userData.hullBaseYaw as number;
+    hull.rotation.y = base + tune;
+  }
+
+  /** Numpad 4/6 — rotate the controlled hull mesh left/right (visual only). */
+  private adjustHullYaw(delta: number): void {
+    const g = this.selfGroup;
+    if (!g) return;
+    const assetId = g.userData.hullAssetId as string | undefined;
+    if (!assetId) return;
+    const hull = (g.userData.glb ?? g.userData.fallback) as THREE.Object3D | undefined;
+    if (!hull) return;
+    this.syncHullTune(g);
+    const tune = ((g.userData.hullTuneYaw as number) ?? 0) + delta;
+    g.userData.hullTuneYaw = tune;
+    const base = g.userData.hullBaseYaw as number;
+    hull.rotation.y = base + tune;
+    this.hullTuneHudDeg = (tune * 180) / Math.PI;
+    this.hullTuneSavedMsg = null;
+    repositionThrustersFromHull(g);
+    if (this.motherGroups.has(g)) this.spawnMotherTurrets(g);
+  }
+
+  /** Numpad 5 — persist the current hull-yaw tune for this ship slot. */
+  private saveHullYawTune(): void {
+    const g = this.selfGroup;
+    if (!g) return;
+    const assetId = g.userData.hullAssetId as string | undefined;
+    if (!assetId) return;
+    this.syncHullTune(g);
+    const tune = (g.userData.hullTuneYaw as number) ?? 0;
+    const ok = saveHullYawTune(assetId, tune);
+    const deg = (tune * 180) / Math.PI;
+    this.hullTuneHudDeg = deg;
+    this.hullTuneSavedMsg = ok
+      ? `Hull yaw saved (${deg.toFixed(1)}°) · ${assetId.split("/").pop()}`
+      : "Could not save hull yaw";
+    this.hullTuneSavedAt = performance.now();
+  }
+
   private updateThrusters(dt: number): void {
     const t = performance.now() * 0.001;
     if (this.selfGroup) {
       const sp = Math.hypot(this.self.vx, this.self.vy, this.self.vz);
-      updateThrusterSet(this.selfGroup, sp, t, dt, this.selfBoosting);
+      updateThrusterSet(this.selfGroup, sp, t, dt, this.selfBoosting, {
+        vx: this.self.vx, vy: this.self.vy, vz: this.self.vz,
+        yaw: this.self.yaw, pitch: this.self.pitch,
+      });
     }
     for (const [id, view] of this.remotes) {
       const e = this.latestEntities.get(id);
       const sp = e ? Math.hypot(e.vx, e.vy, e.vz) : 0;
-      updateThrusterSet(view.group, sp, t, dt, e ? e.boost && e.alive : undefined);
+      updateThrusterSet(view.group, sp, t, dt, e ? e.boost && e.alive : undefined,
+        e ? { vx: e.vx, vy: e.vy, vz: e.vz, yaw: e.yaw, pitch: e.pitch } : undefined);
     }
   }
 
@@ -932,14 +1060,23 @@ export class CarrierGame {
   }
 
   /** Role-classed fleet unit — GLB hull over a role-coloured procedural fallback. */
-  private makeFleetUnit(role: FleetRole, faction: FactionId): THREE.Group {
+  private makeFleetUnit(role: FleetRole, faction: FactionId, entityId: string): THREE.Group {
     const g = new THREE.Group();
-    const def = fleetRoleDef(role);
-    const fb = this.buildProceduralFleet(role);
+    const def = fleetRoleDefFor(faction, role) ?? fleetRoleDef(role);
+    const fb = this.buildProceduralFleet(role, faction);
     g.add(fb);
     g.userData.fallback = fb;
+    g.userData.fleetDebugKey = entityId;
     if (role !== "none") {
-      this.requestShipModel(g, fleetModelFor(faction, role as DeployRole), faction, def ? def.scale : 8);
+      const model = fleetModelFor(faction, role as DeployRole);
+      this.requestShipModel(g, model, faction, def ? def.scale : 8, {
+        key: entityId,
+        assetId: model.id,
+        faction,
+        role,
+        source: "match",
+        label: def?.label,
+      });
       attachThrusters(g, {
         kind: "fleet_unit",
         color: ROLE_COLORS[role],
@@ -951,9 +1088,9 @@ export class CarrierGame {
   }
 
   /** Procedural fleet-hull fallback (role-coloured) shown until the GLB loads. */
-  private buildProceduralFleet(role: FleetRole): THREE.Group {
+  private buildProceduralFleet(role: FleetRole, faction: FactionId): THREE.Group {
     const g = new THREE.Group();
-    const def = fleetRoleDef(role);
+    const def = fleetRoleDefFor(faction, role) ?? fleetRoleDef(role);
     const len = def ? def.scale : 8;
     const color = role !== "none" ? ROLE_COLORS[role] : "#ffffff";
     const col = new THREE.Color(color);
@@ -1016,14 +1153,32 @@ export class CarrierGame {
    *  procedural fallback in `group`. loadAsset's promise cache shares one decode
    *  across concurrent requests for the same id. */
   private requestShipModel(
-    group: THREE.Group, model: ShipModel, faction: FactionId, fit: number,
+    group: THREE.Group,
+    model: ShipModel,
+    faction: FactionId,
+    fit: number,
+    debug?: Parameters<typeof loadHullModel>[3],
   ): void {
-    loadHullModel(model, faction, fit)
-      .then((clone) => {
-        if (this.disposed || !group.parent) { disposeGroup(clone); return; }
-        this.swapFallback(group, clone);
-      })
-      .catch(() => { /* keep the procedural fallback */ });
+    const dbgKey = debug?.key ?? (group.userData.fleetDebugKey as string | undefined);
+    const attempt = (triesLeft: number) => {
+      loadHullModel(model, faction, fit, debug)
+        .then((clone) => {
+          if (this.disposed || !group.parent) {
+            disposeGroup(clone);
+            if (dbgKey) fleetDebug.fallback(dbgKey, "entity removed before hull swap");
+            return;
+          }
+          this.swapFallback(group, clone);
+        })
+        .catch((err) => {
+          if (triesLeft > 0) {
+            attempt(triesLeft - 1);
+            return;
+          }
+          if (dbgKey) fleetDebug.fallback(dbgKey, err instanceof Error ? err.message : String(err));
+        });
+    };
+    attempt(1);
   }
 
   /** Async-load a faction's (possibly multi-part) OBJ station, assemble the
@@ -1048,7 +1203,10 @@ export class CarrierGame {
     }
     group.add(model);
     group.userData.glb = model;
-    if (this.motherGroups.has(group)) this.tryMountMotherTurrets(group);
+    group.userData.hullBaseYaw = undefined;
+    if (this.motherGroups.has(group)) this.spawnMotherTurrets(group);
+    this.syncHullTune(group);
+    repositionThrustersFromHull(group);
   }
 
   /** Faint wireframe sphere marking a unit's rated operation zone. */
@@ -1088,6 +1246,9 @@ export class CarrierGame {
     // Mothership camera modes: V cycles follow→orbit→free; B cycles orbit vantage.
     if (e.code === "KeyV") { this.cycleCamMode(); return; }
     if (e.code === "KeyB" && this.camMode === "orbit") { this.cycleVantage(); return; }
+    if (e.code === "Numpad4") { e.preventDefault(); this.adjustHullYaw(HULL_YAW_STEP); return; }
+    if (e.code === "Numpad6") { e.preventDefault(); this.adjustHullYaw(-HULL_YAW_STEP); return; }
+    if (e.code === "Numpad5") { e.preventDefault(); this.saveHullYawTune(); return; }
     this.keys.add(e.code);
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(e.code))
       e.preventDefault();
@@ -1191,6 +1352,20 @@ export class CarrierGame {
       const eco = m.economy.find((e) => e.playerId === this.selfId);
       if (eco) {
         this.motherShipId = eco.motherShipId;
+        const navLabel = eco.navTarget?.celestialId
+          ? (eco.navTarget.celestialId.startsWith("planet-")
+            ? `System ${eco.navTarget.celestialId.slice(-4)}`
+            : `Rock ${eco.navTarget.celestialId.slice(-4)}`)
+          : eco.navTarget
+            ? "Map waypoint"
+            : undefined;
+        this.motherMission = {
+          navActive: !!eco.navTarget,
+          navLabel,
+          claimedRockId: eco.claimedRockId,
+          atRockNode: !!eco.atRockNode,
+          produceProgress: eco.produceProgress ?? 0,
+        };
         // When control switches to a different entity, drop any inputs still
         // queued for the old one — the server discards queued commands on
         // `become`, so replaying them onto the new entity would jitter it.
@@ -1225,10 +1400,7 @@ export class CarrierGame {
     for (const id of [...this.projs.keys()]) if (!seen.has(id)) this.projs.delete(id);
 
     for (const ev of m.events) {
-      if (ev.k === "explode") {
-        this.spawnExplosion(ev.px, ev.py, ev.pz, true, ev.radius ?? MISSILE.splashRadius);
-        this.applyExplosionKick(ev.px, ev.py, ev.pz, ev.radius ?? MISSILE.splashRadius);
-      }
+      if (ev.k === "explode") this.spawnExplosion(ev.px, ev.py, ev.pz, true);
       else if (ev.k === "hit") {
         this.spawnImpact(ev.px, ev.py, ev.pz);
         this.vfx?.play("explosion", new THREE.Vector3(ev.px, ev.py, ev.pz), { scale: 0.55, ttl: 420 });
@@ -1236,6 +1408,10 @@ export class CarrierGame {
         this.vfx?.play("muzzleFlash", new THREE.Vector3(ev.px, ev.py, ev.pz), { scale: 0.9, ttl: 120 });
       } else if (ev.k === "impact") this.spawnImpact(ev.px, ev.py, ev.pz);
       else if (ev.k === "reward") this.spawnPickup(ev.px, ev.py, ev.pz);
+      else if (ev.k === "universe") {
+        this.universeEvent = { kind: ev.kind, msg: ev.msg, at: performance.now() };
+        this.spawnImpact(ev.px, ev.py, ev.pz);
+      }
     }
   }
 
@@ -1297,6 +1473,7 @@ export class CarrierGame {
     this.updateThrusters(dt);
     this.vfx?.update(dt);
     this.updateCamera(dt);
+    this.updateAimScreen();
     this.updateTutorial();
 
     // Keep sun billboard always facing camera
@@ -1323,6 +1500,8 @@ export class CarrierGame {
       this.selfGroup = this.makeEntityGroup(ent);
       this.scene.add(this.selfGroup);
       this.selfGroupKey = key;
+      this.hullTuneHudDeg = null;
+      this.hullTuneSavedMsg = null;
     }
     this.selfGroup.position.set(this.self.px, this.self.py, this.self.pz);
     applyOrientation(this.selfGroup, this.self.yaw, this.self.pitch, this.self.roll);
@@ -1596,6 +1775,7 @@ export class CarrierGame {
         this.scene.remove(view.group);
         disposeGroup(view.group);
         if (view.zone) { this.scene.remove(view.zone); disposeGroup(view.zone); }
+        fleetDebug.remove(id);
         this.remotes.delete(id);
       }
     }
@@ -1630,7 +1810,7 @@ export class CarrierGame {
       return { text: own ? "CARRIER" : "CAPITAL", color: own ? "#66ddff" : "#aabbcc", show: true };
     }
     if (s.kind === "fleet_unit" && s.role !== "none") {
-      const def = fleetRoleDef(s.role);
+      const def = fleetRoleDefFor(s.faction, s.role) ?? fleetRoleDef(s.role);
       return { text: (def?.label ?? s.role).toUpperCase(), color: ROLE_COLORS[s.role], show: true };
     }
     if (own) return { text: s.kind === "fighter" ? "FIGHTER" : "ALLY", color: "#8fe3ff", show: true };
@@ -1666,18 +1846,76 @@ export class CarrierGame {
     }
   }
 
+  /** Lazy-load homing-missile GLBs once; projectiles keep the cone fallback until ready. */
+  private ensureMissileTemplates(): void {
+    if (this.missileReq) return;
+    this.missileReq = true;
+    loadAsset("props/carrier/missile")
+      .then((m: LoadedModel) => { if (!this.disposed) this.missileTpl = m.scene; })
+      .catch(() => { /* procedural cone fallback */ });
+    for (let i = 0; i < 9; i++) {
+      const slot = i;
+      loadAsset(`props/carrier/auryn-rockets/rocket${i + 1}`)
+        .then((m: LoadedModel) => {
+          if (!this.disposed) this.aurynRocketTpls[slot] = m.scene;
+        })
+        .catch(() => { /* procedural cone fallback */ });
+    }
+  }
+
+  private cloneMissileTpl(tpl: THREE.Object3D): THREE.Object3D {
+    const obj = tpl.clone(true);
+    obj.traverse((o) => {
+      if (o instanceof THREE.Mesh) {
+        o.userData.sharedGeo = true;
+        const mm = o.material;
+        o.material = Array.isArray(mm)
+          ? mm.map((x) => (x as THREE.Material).clone())
+          : (mm as THREE.Material).clone();
+      }
+    });
+    fitObject(obj, SCALE.ship.miner * 1.3);
+    obj.userData.glbProjectile = true;
+    return obj;
+  }
+
+  private createProjectileMesh(
+    id: number,
+    isMissile: boolean,
+    ownerEnt: EntityState | undefined,
+  ): THREE.Object3D {
+    if (!isMissile) {
+      return new THREE.Mesh(this.projGeo, this.projMat);
+    }
+    this.ensureMissileTemplates();
+    const autoSalvo = ownerEnt?.kind === "mother_ship" || ownerEnt?.kind === "fleet_unit";
+    const tpl = autoSalvo
+      ? this.aurynRocketTpls[Math.abs(id) % 9]
+      : this.missileTpl;
+    if (tpl) return this.cloneMissileTpl(tpl);
+    const mesh = new THREE.Mesh(this.missileGeo, this.missileMat);
+    mesh.userData.proceduralMissile = true;
+    return mesh;
+  }
+
+  private disposeProjectileMesh(mesh: THREE.Object3D): void {
+    if (mesh.userData.glbProjectile) disposeGroup(mesh);
+  }
+
   private updateProjectiles(): void {
     const now = performance.now();
     const extrap = Math.min(0.12, (now - this.lastSnapAt) / 1000);
     const spin = now * 0.02;
     const seen = new Set<number>();
     for (const [id, p] of this.projs) {
+      // Mothership turret bolts are drawn as beams — skip duplicate bolt meshes.
+      const ownerEnt = this.latestEntities.get(p.owner);
+      if (ownerEnt?.kind === "mother_ship" && p.kind !== "missile") continue;
       seen.add(id);
       const isMissile = p.kind === "missile";
       let mesh = this.projMeshes.get(id);
       if (!mesh) {
-        mesh = new THREE.Mesh(isMissile ? this.missileGeo : this.projGeo,
-          isMissile ? this.missileMat : this.projMat);
+        mesh = this.createProjectileMesh(id, isMissile, ownerEnt);
         this.scene.add(mesh);
         this.projMeshes.set(id, mesh);
         const trail = this.vfx?.track(
@@ -1686,15 +1924,7 @@ export class CarrierGame {
           { scale: isMissile ? 2.2 : 1.6, color: isMissile ? "#ff6622" : undefined },
         );
         if (trail) this.projTrails.set(id, trail);
-        if (isMissile) {
-          this.projHistory.set(id, []);
-          const ribbon = this.vfx?.weaponTrail({
-            color: "#ff8844",
-            duration: 0.28,
-            segments: 20,
-          });
-          if (ribbon) this.projWeaponTrails.set(id, ribbon);
-        }
+        if (isMissile) this.projHistory.set(id, []);
       }
       mesh.position.set(p.px + p.vx * extrap, p.py + p.vy * extrap, p.pz + p.vz * extrap);
       const sp = Math.hypot(p.vx, p.vy, p.vz);
@@ -1722,12 +1952,6 @@ export class CarrierGame {
               (line.geometry as THREE.BufferGeometry).setFromPoints(pts);
             }
           }
-          const ribbon = this.projWeaponTrails.get(id);
-          if (ribbon) {
-            const tailLen = 10 + Math.min(14, sp * 0.04);
-            _btail.copy(mesh.position).addScaledVector(_bdir, -tailLen);
-            ribbon.push(mesh.position, _btail);
-          }
         } else {
           _spinQ.setFromAxisAngle(_bdir, spin);
           mesh.quaternion.copy(_spinQ).multiply(_bquat);
@@ -1738,6 +1962,7 @@ export class CarrierGame {
     for (const [id, mesh] of [...this.projMeshes]) {
       if (!seen.has(id)) {
         this.scene.remove(mesh);
+        this.disposeProjectileMesh(mesh);
         this.projMeshes.delete(id);
         const trail = this.projTrails.get(id);
         if (trail) { trail.stop(); this.projTrails.delete(id); }
@@ -1748,8 +1973,6 @@ export class CarrierGame {
           (line.material as THREE.Material).dispose();
           this.projSplines.delete(id);
         }
-        const ribbon = this.projWeaponTrails.get(id);
-        if (ribbon) { ribbon.stop(); this.projWeaponTrails.delete(id); }
         this.projHistory.delete(id);
       }
     }
@@ -1805,6 +2028,33 @@ export class CarrierGame {
     const targetFov = CAMERA.fov + (boosting ? CAMERA.boostFovKick : 0);
     this.camera.fov += (targetFov - this.camera.fov) * Math.min(1, 6 * dt);
     this.camera.updateProjectionMatrix();
+  }
+
+  /** Project the ship's nose aim onto screen space for the HUD reticle. */
+  private updateAimScreen(): void {
+    if (!this.self.alive || !this.pointerLocked) {
+      this.aimScreen = null;
+      return;
+    }
+    const [fx, fy, fz] = forwardVec(this.self.yaw, this.self.pitch);
+    const aimDist = 2400;
+    const world = new THREE.Vector3(
+      this.self.px + fx * aimDist,
+      this.self.py + fy * aimDist,
+      this.self.pz + fz * aimDist,
+    );
+    world.project(this.camera);
+    if (world.z > 1 || !Number.isFinite(world.x) || !Number.isFinite(world.y)) {
+      this.aimScreen = null;
+      return;
+    }
+    this.aimScreen = {
+      x: (world.x * 0.5 + 0.5),
+      y: (-world.y * 0.5 + 0.5),
+    };
+    if (this.aimScreen.x < -0.05 || this.aimScreen.x > 1.05 || this.aimScreen.y < -0.05 || this.aimScreen.y > 1.05) {
+      this.aimScreen = null;
+    }
   }
 
   // ---- opening cinematic + flight training ---------------------------------
@@ -1996,49 +2246,9 @@ export class CarrierGame {
     this.camera.updateProjectionMatrix();
   }
 
-  /** Client-side knockback mirroring server `applyExplosionForce` on the piloted hull. */
-  private applyExplosionKick(cx: number, cy: number, cz: number, radius: number): void {
-    const ceid = this.controlledEntityId;
-    if (!ceid) return;
-    const auth = this.latestEntities.get(ceid);
-    if (!auth || !auth.alive) return;
-    const dx = auth.px - cx;
-    const dy = auth.py - cy;
-    const dz = auth.pz - cz;
-    const d2 = dx * dx + dy * dy + dz * dz;
-    const r = Math.max(1, radius);
-    if (d2 >= r * r || d2 < 1e-6) return;
-    const d = Math.sqrt(d2);
-    const t = 1 - d / r;
-    const impulse = EXPLOSION.peakImpulse * (EXPLOSION.edgeFalloff + (1 - EXPLOSION.edgeFalloff) * t * t);
-    const inv = impulse / d;
-    this.self.vx += dx * inv;
-    this.self.vy += dy * inv;
-    this.self.vz += dz * inv;
-  }
-
-  private spawnExplosion(
-    x: number,
-    y: number,
-    z: number,
-    big = false,
-    splashRadius: number = MISSILE.splashRadius,
-  ): void {
+  private spawnExplosion(x: number, y: number, z: number, big = false): void {
     const pos = new THREE.Vector3(x, y, z);
-    this.vfx?.play("explosion", pos, { scale: big ? 1.6 : 0.95, ttl: big ? 950 : 650 });
-    this.vfx?.shockwave(pos, {
-      color: "#ff6622",
-      radius: splashRadius * 0.55,
-      duration: 0.55,
-    });
-    const aoeMat = new THREE.MeshBasicMaterial({
-      color: 0xff8844, transparent: true, opacity: 0.35,
-      depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
-    });
-    const aoe = new THREE.Mesh(new THREE.SphereGeometry(splashRadius, 20, 14), aoeMat);
-    aoe.position.copy(pos);
-    this.scene.add(aoe);
-
+    this.vfx?.play("explosion", pos, { scale: big ? 1.4 : 0.85, ttl: big ? 900 : 600 });
     const mat = new THREE.MeshBasicMaterial({ color: 0xff6622, transparent: true, opacity: 0.9 });
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(SCALE.ship.miner * (big ? 1.6 : 1), 10, 10),
@@ -2051,19 +2261,9 @@ export class CarrierGame {
     const tick = () => {
       if (this.disposed) return;
       const t = (performance.now() - born) / dur;
-      if (t >= 1) {
-        this.scene.remove(mesh);
-        mesh.geometry.dispose();
-        mat.dispose();
-        this.scene.remove(aoe);
-        aoe.geometry.dispose();
-        aoeMat.dispose();
-        return;
-      }
+      if (t >= 1) { this.scene.remove(mesh); mesh.geometry.dispose(); mat.dispose(); return; }
       mesh.scale.setScalar(1 + t * (big ? 18 : 12));
       mat.opacity = 0.9 * (1 - t);
-      aoeMat.opacity = 0.35 * (1 - t);
-      aoe.scale.setScalar(0.35 + t * 0.85);
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
@@ -2185,22 +2385,76 @@ export class CarrierGame {
     }
   }
 
+  private ensureRockMeshes(): void {
+    if (this.rockReq) return;
+    this.rockReq = true;
+    const ids = ["props/rock1", "props/rock2"] as const;
+    ids.forEach((id, i) => {
+      loadAsset(id)
+        .then((m: LoadedModel) => {
+          if (!this.disposed) this.rockTpls[i] = m.scene;
+        })
+        .catch(() => { /* keep procedural fallback */ });
+    });
+  }
+
   private makeCelestial(body: CelestialBody): THREE.Group {
     const g = new THREE.Group();
+    this.ensureRockMeshes();
+    this.ensureSolarSystemTemplate();
     const palette: Record<string, { base: number; emissive: number }> = {
       planet: { base: 0x6b8cae, emissive: 0x16243a },
       comet: { base: 0xbfe6ff, emissive: 0x335577 },
       asteroid: { base: 0x8a7f72, emissive: 0x1a1410 },
     };
     const c = palette[body.kind];
-    const detail = body.kind === "planet" ? 2 : 1;
-    const mesh = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(body.radius, detail),
-      new THREE.MeshStandardMaterial({
-        color: c.base, emissive: c.emissive, roughness: 0.95, metalness: 0.05, flatShading: body.kind !== "planet",
-      }),
-    );
-    g.add(mesh);
+    if (body.kind === "planet" && this.solarSystemTpl) {
+      const sys = this.solarSystemTpl.clone(true);
+      sys.traverse((o) => {
+        if (o instanceof THREE.Mesh) {
+          o.userData.sharedGeo = true;
+          const mm = o.material;
+          o.material = Array.isArray(mm)
+            ? mm.map((m) => m.clone())
+            : mm.clone();
+        }
+      });
+      fitObject(sys, body.radius * 2.8);
+      g.add(sys);
+    } else if (body.kind === "asteroid") {
+      const rockTpl = this.rockTpls[(body.seed >>> 0) % 2];
+      if (rockTpl) {
+        const rock = rockTpl.clone(true);
+        rock.traverse((o) => {
+          if (o instanceof THREE.Mesh) {
+            o.userData.sharedGeo = true;
+            const mm = o.material;
+            o.material = Array.isArray(mm)
+              ? mm.map((m) => m.clone())
+              : mm.clone();
+          }
+        });
+        fitObject(rock, body.radius * 2);
+        g.add(rock);
+      } else {
+        const mesh = new THREE.Mesh(
+          new THREE.IcosahedronGeometry(body.radius, 1),
+          new THREE.MeshStandardMaterial({
+            color: c.base, emissive: c.emissive, roughness: 0.95, metalness: 0.05, flatShading: true,
+          }),
+        );
+        g.add(mesh);
+      }
+    } else {
+      const detail = body.kind === "planet" ? 2 : 1;
+      const mesh = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(body.radius, detail),
+        new THREE.MeshStandardMaterial({
+          color: c.base, emissive: c.emissive, roughness: 0.95, metalness: 0.05, flatShading: body.kind !== "planet",
+        }),
+      );
+      g.add(mesh);
+    }
 
     // A faint force-field halo coloured by gravity (blue) vs push (orange).
     const halo = new THREE.Mesh(
@@ -2448,25 +2702,32 @@ export class CarrierGame {
       if (!ok) this.escorting.delete(id);
     }
 
+    const myFaction = this.opts.faction ?? FACTION_ORDER[0];
     const fleet: FleetRow[] = [];
     const roleCounts: Partial<Record<FleetRole, number>> = {};
     for (const entity of this.latestEntities.values()) {
       if (entity.kind !== "fleet_unit" || entity.owner !== this.selfId) continue;
       if (entity.role === "none") continue;
       roleCounts[entity.role] = (roleCounts[entity.role] ?? 0) + 1;
+      const ef = entity.faction ?? myFaction;
+      const hullModel = fleetModelFor(ef, entity.role as DeployRole);
+      const hullDbg = fleetDebug.get(entity.id);
       fleet.push({
         id: entity.id,
         role: entity.role,
-        label: fleetRoleDef(entity.role)?.label ?? entity.role,
+        label: fleetRoleDefFor(ef, entity.role)?.label ?? entity.role,
         hpPct: Math.max(0, Math.min(1, entity.hp / entity.maxHp)),
         shieldPct: entity.maxShield > 0
           ? Math.max(0, Math.min(1, entity.shield / entity.maxShield)) : 0,
+        hullPhase: hullDbg?.phase ?? "pending",
+        hullAssetId: hullModel.id,
+        hullError: hullDbg?.error,
       });
     }
     const totalFleet = fleet.length;
 
     const deployOptions: DeployOption[] = DEPLOYABLE_ROLES.map((role) => {
-      const def = FLEET_ROLES[role];
+      const def = fleetRoleDefFor(myFaction, role)!;
       const ofRole = roleCounts[role] ?? 0;
       const available =
         credits >= def.cost &&
@@ -2481,7 +2742,7 @@ export class CarrierGame {
       if (entity.owner !== this.selfId || !entity.alive) continue;
       const label = entity.kind === "mother_ship" ? "Carrier"
         : entity.kind === "fighter" ? "Fighter"
-        : fleetRoleDef(entity.role)?.label ?? entity.role;
+        : fleetRoleDefFor(myFaction, entity.role)?.label ?? entity.role;
       const summonable = entity.kind === "fleet_unit"
         && entity.role !== "none" && entity.id !== ceid;
       roster.push({
@@ -2511,6 +2772,9 @@ export class CarrierGame {
     });
 
     const factionDef = FACTIONS[this.opts.faction ?? FACTION_ORDER[0]];
+    const fdSnap = fleetDebug.snapshot();
+    const lq = getLoadQueueStats();
+    const ws = getWarmupState();
     this.onHud({
       status: this.status,
       faction: { id: factionDef.id, name: factionDef.name, color: factionDef.color },
@@ -2541,9 +2805,47 @@ export class CarrierGame {
       controllingMother: this.controllingMother(),
       cinematic: this.cinematicActive,
       hint: this.tutorialHint(),
+      fleetDebug: {
+        enabled: fdSnap.enabled,
+        pending: fdSnap.summary.pending,
+        glb: fdSnap.summary.glb,
+        fallback: fdSnap.summary.fallback,
+        error: fdSnap.summary.error,
+        rows: fdSnap.entries.map((e) => ({
+          key: e.key,
+          label: e.label,
+          assetId: e.assetId,
+          phase: e.phase,
+          attempts: e.attempts,
+          skinned: e.skinned,
+          durationMs: e.durationMs,
+          error: e.error,
+          source: e.source,
+        })),
+        loadQueue: {
+          maxConcurrency: lq.maxConcurrency,
+          inFlight: lq.inFlight,
+          queued: lq.queued,
+          completed: lq.completed,
+          failed: lq.failed,
+        },
+        warmupPhase: ws.phase,
+        cdn: ws.cdn,
+      },
       aiming: this.pointerLocked,
       firingPrimary: this.mouseBtns.has(0) || this.keys.has("Space") || this.keys.has("KeyF"),
       firingMissile: this.mouseBtns.has(2),
+      aimScreen: this.aimScreen,
+      motherMission: { ...this.motherMission },
+      hullTuneDeg: this.hullTuneHudDeg,
+      hullTuneSaved:
+        this.hullTuneSavedMsg && performance.now() - this.hullTuneSavedAt < 3500
+          ? this.hullTuneSavedMsg
+          : null,
+      universeEvent:
+        this.universeEvent && performance.now() - this.universeEvent.at < 12000
+          ? { kind: this.universeEvent.kind, msg: this.universeEvent.msg }
+          : null,
     });
   }
 
@@ -2579,6 +2881,33 @@ export class CarrierGame {
         color: o.cleared ? "#2bd96b" : "#ff3b30",
       });
     }
+    for (const c of this.latestCelestials.values()) {
+      if (c.kind === "planet") {
+        blips.push({
+          x: norm(c.px),
+          y: norm(c.pz),
+          kind: "system",
+          color: "#5a9fd4",
+          id: c.id,
+          label: `System ${c.id.slice(-4)}`,
+          mission: true,
+        });
+        continue;
+      }
+      const isMission = c.kind === "asteroid"
+        && c.id !== this.motherMission.claimedRockId;
+      blips.push({
+        x: norm(c.px),
+        y: norm(c.pz),
+        kind: "rock",
+        color: c.id === this.motherMission.claimedRockId
+          ? "#2bd96b"
+          : c.kind === "asteroid" ? "#8a7f72" : "#9ec8ff",
+        id: c.id,
+        label: c.kind === "asteroid" ? `Rock ${c.id.slice(-4)}` : c.kind,
+        mission: isMission,
+      });
+    }
     return blips;
   }
 
@@ -2607,6 +2936,18 @@ export class CarrierGame {
   deploy(role: FleetRole): void {
     if (this.status !== "connected") return;
     this.socket.send({ t: "deploy", role });
+  }
+
+  /** Order the mothership to navigate to a map target (optionally claim a rock). */
+  navigate(tx: number, ty: number, tz: number, celestialId?: string): void {
+    if (this.status !== "connected") return;
+    this.socket.send({ t: "navigate", tx, ty, tz, celestialId });
+  }
+
+  /** Queue one level-1 craft at the rock node (miner). */
+  produce(): void {
+    if (this.status !== "connected") return;
+    this.socket.send({ t: "produce" });
   }
 
   // ---- teardown -------------------------------------------------------------
@@ -2647,7 +2988,10 @@ export class CarrierGame {
     for (const g of [...this.motherGroups]) this.disposeMother(g);
     for (const trail of this.projTrails.values()) trail.stop();
     this.projTrails.clear();
-    for (const mesh of this.projMeshes.values()) this.scene.remove(mesh);
+    for (const mesh of this.projMeshes.values()) {
+      this.scene.remove(mesh);
+      this.disposeProjectileMesh(mesh);
+    }
     this.projMeshes.clear();
     for (const line of this.projSplines.values()) {
       this.scene.remove(line);
@@ -2744,7 +3088,6 @@ function applyOrientation(group: THREE.Object3D, yaw: number, pitch: number, rol
 const _ba = new THREE.Vector3();
 const _bb = new THREE.Vector3();
 const _bdir = new THREE.Vector3();
-const _btail = new THREE.Vector3();
 const _bup = new THREE.Vector3(0, 1, 0);
 const _bquat = new THREE.Quaternion();
 const _spinQ = new THREE.Quaternion();

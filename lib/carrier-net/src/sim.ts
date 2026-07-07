@@ -9,13 +9,12 @@
  * client.  `fleetIntent` runs SERVER-ONLY (clients only interpolate fleet units)
  * but is kept pure + deterministic so the simulation is reproducible.
  */
-import { collideRadius } from "./colliders";
 import {
   CELESTIAL,
   COLLISION,
   ESCORT,
-  EXPLOSION,
   SHIP,
+  SHIP_COLLIDE_RADIUS,
   armorFor,
   fleetRoleDef,
   forwardVec,
@@ -28,8 +27,7 @@ import {
   type Obstacle,
   type ShipState,
 } from "./types";
-
-export { collideRadius } from "./colliders";
+import { fleetRoleDefFor } from "./factionRoster";
 
 const clamp = (v: number, lo: number, hi: number) =>
   v < lo ? lo : v > hi ? hi : v;
@@ -113,8 +111,22 @@ export function stepShip(s: ShipState, cmd: InputCommand, dt: number): ShipState
  * walls of its cubic confinement region.  Planets (zero region/velocity by
  * convention) are static anchors and are left untouched.
  */
+/** Slow Y-axis orbit for large planets (server-authoritative). */
+export function stepPlanetOrbit(b: CelestialBody, dt: number): void {
+  if (b.kind !== "planet" || !b.orbitOmega || !b.orbitR) return;
+  if (dt <= 0) return;
+  const phase = (b.orbitPhase ?? 0) + b.orbitOmega * dt;
+  b.orbitPhase = phase;
+  b.px = Math.cos(phase) * b.orbitR;
+  b.pz = Math.sin(phase) * b.orbitR;
+  b.py = b.orbitPy ?? b.py;
+}
+
 export function stepCelestial(b: CelestialBody, dt: number): void {
-  if (b.kind === "planet") return;
+  if (b.kind === "planet") {
+    stepPlanetOrbit(b, dt);
+    return;
+  }
   if (dt <= 0) return;
 
   b.px += b.vx * dt;
@@ -231,7 +243,7 @@ export function resolveCelestialPenetration(
   let contact: { px: number; py: number; pz: number } | null = null;
   for (const b of bodies) {
     const dx = s.px - b.px, dy = s.py - b.py, dz = s.pz - b.pz;
-    const minD = b.radius + collideRadius(s);
+    const minD = b.radius + SHIP_COLLIDE_RADIUS;
     const d2 = dx * dx + dy * dy + dz * dz;
     if (d2 >= minD * minD) continue;
     const d = d2 > 1e-6 ? Math.sqrt(d2) : 1e-3;
@@ -278,42 +290,21 @@ export function damageEntity(e: EntityState, amount: number): number {
   return rem;
 }
 
-/**
- * Apply radial knockback from a detonation. Mutates entity velocities in place.
- * Falloff is quadratic from centre → edge; skips entities outside `radius`.
- */
-export function applyExplosionForce(
-  ships: Iterable<EntityState>,
-  cx: number,
-  cy: number,
-  cz: number,
-  radius: number,
-  peak = EXPLOSION.peakImpulse,
-): void {
-  const r = Math.max(1, radius);
-  const r2 = r * r;
-  for (const s of ships) {
-    if (!s.alive) continue;
-    const dx = s.px - cx;
-    const dy = s.py - cy;
-    const dz = s.pz - cz;
-    const d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 >= r2 || d2 < 1e-6) continue;
-    const d = Math.sqrt(d2);
-    const t = 1 - d / r;
-    const impulse = peak * (EXPLOSION.edgeFalloff + (1 - EXPLOSION.edgeFalloff) * t * t);
-    const inv = impulse / d;
-    s.vx += dx * inv;
-    s.vy += dy * inv;
-    s.vz += dz * inv;
+/** Physical collision radius (m) for an entity kind/role. */
+export function collideRadius(e: EntityState): number {
+  if (e.kind === "mother_ship") return 120;
+  if (e.kind === "fleet_unit") {
+    const def = fleetRoleDefFor(e.faction, e.role);
+    return def ? Math.max(SHIP_COLLIDE_RADIUS, def.scale * 0.6) : SHIP_COLLIDE_RADIUS;
   }
+  return SHIP_COLLIDE_RADIUS;
 }
 
 /** Relative collision mass (heavier hulls shove lighter ones aside). */
 export function collisionMass(e: EntityState): number {
   if (e.kind === "mother_ship") return 400;
   if (e.kind === "fleet_unit") {
-    const def = fleetRoleDef(e.role);
+    const def = fleetRoleDefFor(e.faction, e.role);
     return def ? 1 + def.scale * 0.15 : 2;
   }
   return 1; // fighter
@@ -462,7 +453,6 @@ const ZERO_CMD: InputCommand = {
   roll: 0,
   boost: false,
   fire: false,
-  missile: false,
 };
 
 function len(x: number, y: number, z: number): number {
@@ -478,7 +468,7 @@ function goalFor(
   const z = ctx.zone;
 
   // Combat roles chase a hostile when one is in range.
-  const def = fleetRoleDef(role);
+  const def = fleetRoleDefFor(unit.faction, role);
   if (def && def.armed && ctx.hostile) {
     const h = ctx.hostile;
     const d = len(h.px - unit.px, h.py - unit.py, h.pz - unit.pz);
@@ -538,22 +528,15 @@ export function fleetIntent(unit: EntityState, ctx: FleetContext): InputCommand 
   if (!steer) return { ...ZERO_CMD };
 
   // Fire when armed, engaging a hostile, and pointed close enough at it.
-  const def = fleetRoleDef(unit.role);
+  const def = fleetRoleDefFor(unit.faction, unit.role);
   let fire = false;
-  let boost = false;
   if (def && def.armed && goal.engage && ctx.hostile) {
     const h = ctx.hostile;
     const d = len(h.px - unit.px, h.py - unit.py, h.pz - unit.pz);
-    const aimTol = unit.role === "scout" || unit.role === "corsair" ? 0.38 : 0.28;
     fire =
       d <= def.fireRange &&
-      Math.abs(steer.yawDiff) < aimTol &&
-      Math.abs(steer.pitchDiff) < aimTol;
-    // Drone fighters close fast and weave — light afterburner while engaging.
-    if (goal.engage && (unit.role === "scout" || unit.role === "corsair") && d > 90) {
-      boost = true;
-      steer.thrust = Math.min(1, steer.thrust + 0.25);
-    }
+      Math.abs(steer.yawDiff) < 0.25 &&
+      Math.abs(steer.pitchDiff) < 0.25;
   }
 
   return {
@@ -563,9 +546,8 @@ export function fleetIntent(unit: EntityState, ctx: FleetContext): InputCommand 
     yaw: steer.yaw,
     pitch: steer.pitch,
     roll: 0,
-    boost,
+    boost: false,
     fire,
-    missile: false,
   };
 }
 
@@ -667,7 +649,7 @@ export interface EscortContext {
 export function escortIntent(unit: EntityState, ctx: EscortContext): InputCommand {
   if (!unit.alive) return { ...ZERO_CMD };
 
-  const def = fleetRoleDef(unit.role);
+  const def = fleetRoleDefFor(unit.faction, unit.role);
 
   // Default goal: the formation slot beside the protected ship.
   let gx = ctx.protect.x + ctx.slot.x;
@@ -705,16 +687,14 @@ export function escortIntent(unit: EntityState, ctx: EscortContext): InputComman
   if (def && def.armed && engage && ctx.hostile) {
     const h = ctx.hostile;
     const d = len(h.px - unit.px, h.py - unit.py, h.pz - unit.pz);
-    const aimTol = unit.role === "scout" || unit.role === "corsair" ? 0.38 : 0.28;
     fire =
       d <= def.fireRange &&
-      Math.abs(steer.yawDiff) < aimTol &&
-      Math.abs(steer.pitchDiff) < aimTol;
+      Math.abs(steer.yawDiff) < 0.25 &&
+      Math.abs(steer.pitchDiff) < 0.25;
   }
 
-  // Catch up to a distant, moving player while not engaging; drone escorts boost in combat.
-  let boost = !engage && steer.dist > ESCORT.catchUpDist;
-  if (engage && def?.armed && (unit.role === "scout" || unit.role === "corsair")) boost = true;
+  // Catch up to a distant, moving player while not engaging.
+  const boost = !engage && steer.dist > ESCORT.catchUpDist;
 
   return {
     seq: 0,
@@ -725,6 +705,5 @@ export function escortIntent(unit: EntityState, ctx: EscortContext): InputComman
     roll: 0,
     boost,
     fire,
-    missile: false,
   };
 }

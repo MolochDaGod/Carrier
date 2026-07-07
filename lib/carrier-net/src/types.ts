@@ -11,6 +11,27 @@
  */
 
 import { newUuid } from "./uuid";
+import { factionFleetShip, fleetRoleDefFor } from "./factionRoster";
+
+export {
+  FACTION_BUILD,
+  FACTION_FLEET,
+  FACTION_MINING,
+  FACTION_MOTHERSHIP,
+  factionFleetShip,
+  fleetRoleDefFor,
+  miningFor,
+  mothershipEntryFor,
+  platformDefFor,
+  statCardForFactionMothership,
+  statCardForFactionRole,
+} from "./factionRoster";
+export type {
+  FactionBuildProfile,
+  FactionFleetShip,
+  FactionMiningProfile,
+  FactionMothershipShip,
+} from "./factionRoster";
 
 export const TICK_HZ = 30;
 export const SNAPSHOT_HZ = 20;
@@ -25,7 +46,8 @@ export const SHIP = {
   boostMaxSpeed: 160,
   boostMult: 1.8,
   drag: 0.7,
-  arena: 5000,
+  /** Play-space half-extent (m) — strategic map + ship bounds. */
+  arena: 12000,
   maxHp: 100,
   /** Regenerating energy shield that soaks weapon + collision damage first. */
   maxShield: 60,
@@ -163,6 +185,14 @@ export function isMinerShipType(shipType: number): boolean {
   return SHIP_IS_MINER[shipType] === true;
 }
 
+/** Credits + range for active asteroid harvesting (shared client/server). */
+export const MINING = {
+  /** Credits per second while a miner hull is locked onto an asteroid. */
+  creditPerSec: 14,
+  /** Max harvest range (m) — server beam + payout use this. */
+  range: 460,
+} as const;
+
 /**
  * Cosmetic hull-turret count a mothership of `shipType` bristles with (20–30).
  * Deterministic and purely visual — heavier capital classes carry more mounts.
@@ -187,11 +217,11 @@ export const WORLD_SEED = 0x10b4c0de;
 /** Tunables for physical celestial bodies (planets, comets, asteroids). */
 export const CELESTIAL = {
   /** How many large planets to scatter through the arena. */
-  planetCount: 5,
+  planetCount: 12,
   /** Drifting comets (small, fast, long force tail). */
-  cometCount: 6,
+  cometCount: 18,
   /** Tumbling asteroids (medium, collide within their region). */
-  asteroidCount: 20,
+  asteroidCount: 55,
   /** Planet visual + collision radius range (m). */
   planetMinR: 200,
   planetMaxR: 1700,
@@ -208,15 +238,28 @@ export const CELESTIAL = {
   /** Force reach as a multiple of body radius. */
   forceReachMult: 6,
   /** Half-extent (m) of the cubic region a moving body is confined to. */
-  regionHalf: 2200,
+  regionHalf: 9000,
+  /** Tighter drift box for comets so they streak across sectors. */
+  cometRegionHalf: 12000,
   /** Speed range (m/s) for moving bodies. */
-  moveSpeedMin: 8,
-  moveSpeedMax: 30,
+  moveSpeedMin: 10,
+  moveSpeedMax: 42,
+  /** Planet orbital angular velocity range (rad/s) around world Y. */
+  orbitOmegaMin: 0.000025,
+  orbitOmegaMax: 0.00011,
+} as const;
+
+/** Server-driven macro events that reshape the live universe over time. */
+export const UNIVERSE = {
+  /** Ticks between universe-wide events (~90 s at TICK_HZ). */
+  eventIntervalTicks: TICK_HZ * 90,
+  /** Max extra transient asteroids injected per spawn event. */
+  spawnBurstCount: 10,
 } as const;
 
 /** Tunables for fly-through reward boxes. */
 export const REWARD = {
-  count: 12,
+  count: 32,
   /** Fly-through pickup radius (m). */
   radius: 34,
   /** Credits granted per pickup. */
@@ -296,7 +339,7 @@ export const BOSS = {
  */
 export const OUTPOST = {
   /** How many mining outposts to seed near asteroids. */
-  count: 8,
+  count: 22,
   /** Default garrison size (tier overrides this per outpost). */
   garrison: 3,
   /** A player within this distance (m) of the outpost wakes its pirates. */
@@ -357,6 +400,13 @@ export interface CelestialBody {
   rhalf: number;
   /** Stable per-body seed for client-side visual variety. */
   seed: number;
+  /** Optional GLB id for the client renderer (e.g. solar-system on planets). */
+  visual?: string;
+  /** Slow orbit around world Y through the origin (planets). */
+  orbitOmega?: number;
+  orbitR?: number;
+  orbitPhase?: number;
+  orbitPy?: number;
 }
 
 /** A glowing pickup box that grants bonus resources on fly-through. */
@@ -530,6 +580,12 @@ export const CARRIER = {
   launchOffset: 40,
   /** Minimum ms a player must wait between two deploys. */
   deployCooldownMs: 600,
+  /** Seconds to fabricate one level-1 craft when the mothership is at a rock node. */
+  motherProduceSec: 8,
+  /** Arrival distance (m) for a map-ordered mothership course. */
+  navArriveDist: 140,
+  /** Range (m) within which a mothership "claims" a targeted asteroid. */
+  rockClaimDist: 200,
 } as const;
 
 // ─── Fleet roles ─────────────────────────────────────────────────────────────
@@ -762,7 +818,8 @@ const round3 = (v: number): number => Math.round(v * 1000) / 1000;
  * the movement balance rather than re-derived, so activating it never re-tunes
  * existing handling.
  */
-function deriveCombat(card: ShipStatCard, speedMult: number): CombatProfile {
+/** Derive sim combat numbers from a stat card + authored speed envelope. */
+export function deriveCombat(card: ShipStatCard, speedMult: number): CombatProfile {
   return {
     armor: round3((card.defense / 100) * MAX_ARMOR),
     damageMult: round3(0.5 + card.attack / 100),
@@ -809,44 +866,58 @@ export const MOTHER_COMBAT: CombatProfile = {
 /** Fallback profile for a roleless (`"none"`) fleet unit — baseline drone. */
 export const BASE_FLEET_COMBAT: CombatProfile = { ...FIGHTER_COMBAT };
 
-/** Resolve the combat profile for an entity by kind + role.  Pure. */
-export function combatProfileFor(kind: EntityKind, role: FleetRole): CombatProfile {
+function factionFleetCombat(faction: FactionId, role: FleetRole): CombatProfile | null {
+  if (!isDeployableRole(role)) return null;
+  const ship = factionFleetShip(faction, role);
+  if (!ship) return null;
+  return deriveCombat(ship.stats, ship.role.speedMult);
+}
+
+/** Resolve the combat profile for an entity by kind + role (+ faction for fleet). */
+export function combatProfileFor(
+  kind: EntityKind,
+  role: FleetRole,
+  faction?: FactionId,
+): CombatProfile {
   if (kind === "mother_ship") return MOTHER_COMBAT;
   if (kind === "fleet_unit") {
+    if (faction) {
+      const fc = factionFleetCombat(faction, role);
+      if (fc) return fc;
+    }
     const i = DEPLOYABLE_ROLES.indexOf(role as Exclude<FleetRole, "none">);
     return i >= 0 ? CLASS_COMBAT[DEPLOYABLE_ROLES[i]] : BASE_FLEET_COMBAT;
   }
-  // fighter + mine (and anything else) fall back to the agile baseline.
   return FIGHTER_COMBAT;
 }
 
 /** Incoming-damage reduction fraction for this entity (DEFENSE stat). */
-export function armorFor(e: Pick<EntityState, "kind" | "role">): number {
-  return combatProfileFor(e.kind, e.role).armor;
+export function armorFor(e: Pick<EntityState, "kind" | "role" | "faction">): number {
+  return combatProfileFor(e.kind, e.role, e.faction).armor;
 }
 
 /** Outgoing weapon damage (per bolt) for this entity (ATTACK stat). */
-export function weaponDamageFor(e: Pick<EntityState, "kind" | "role">): number {
-  return WEAPON.damage * combatProfileFor(e.kind, e.role).damageMult;
+export function weaponDamageFor(e: Pick<EntityState, "kind" | "role" | "faction">): number {
+  return WEAPON.damage * combatProfileFor(e.kind, e.role, e.faction).damageMult;
 }
 
 /** Shield regen (points/sec) for this entity (SHIELD stat). */
-export function shieldRegenPerSecFor(e: Pick<EntityState, "kind" | "role">): number {
-  return combatProfileFor(e.kind, e.role).shieldRegenPerSec;
+export function shieldRegenPerSecFor(e: Pick<EntityState, "kind" | "role" | "faction">): number {
+  return combatProfileFor(e.kind, e.role, e.faction).shieldRegenPerSec;
 }
 
 /** Flight-envelope speed multiplier for this entity (SPEED stat). */
-export function speedMultFor(e: Pick<EntityState, "kind" | "role">): number {
-  return combatProfileFor(e.kind, e.role).speedMult;
+export function speedMultFor(e: Pick<EntityState, "kind" | "role" | "faction">): number {
+  return combatProfileFor(e.kind, e.role, e.faction).speedMult;
 }
 
-/**
- * Whole-tick fire cooldown for a fleet unit, scaling a baseline cadence by the
- * class's SPEED-derived `fireCooldownMult` (faster classes fire more often).
- * Clamped to a sane minimum so no class can machine-gun.
- */
-export function fleetFireCooldownTicks(role: FleetRole, baselineTicks: number): number {
-  const mult = combatProfileFor("fleet_unit", role).fireCooldownMult;
+/** Whole-tick fire cooldown for a fleet unit (faction-aware when provided). */
+export function fleetFireCooldownTicks(
+  role: FleetRole,
+  baselineTicks: number,
+  faction?: FactionId,
+): number {
+  const mult = combatProfileFor("fleet_unit", role, faction).fireCooldownMult;
   return Math.max(3, Math.round(baselineTicks * mult));
 }
 
@@ -1043,6 +1114,12 @@ export interface EntityState {
   boost: boolean;
 }
 
+/** Whether an entity can emit mining beams and earn harvest credits. */
+export function canMineEntity(e: Pick<EntityState, "shipType" | "kind" | "role">): boolean {
+  if (e.kind === "fleet_unit" && e.role === "miner") return true;
+  return isMinerShipType(e.shipType);
+}
+
 export type ShipState = EntityState;
 
 export interface InputCommand {
@@ -1077,7 +1154,15 @@ export type GameEvent =
   | { k: "explode"; px: number; py: number; pz: number; radius?: number }
   | { k: "hit"; px: number; py: number; pz: number }
   | { k: "reward"; px: number; py: number; pz: number }
-  | { k: "impact"; px: number; py: number; pz: number };
+  | { k: "impact"; px: number; py: number; pz: number }
+  | {
+      k: "universe";
+      kind: "drift" | "comet_surge" | "asteroid_burst" | "gravity_pulse";
+      px: number;
+      py: number;
+      pz: number;
+      msg: string;
+    };
 
 /**
  * A continuous beam rendered between a source and a target during live play.
@@ -1109,12 +1194,29 @@ export interface BeamState {
   team: number;
 }
 
+/** Strategic navigation target for the commander's mothership. */
+export interface NavTarget {
+  tx: number;
+  ty: number;
+  tz: number;
+  /** Optional asteroid id — claimed on arrival ("take the rock"). */
+  celestialId?: string;
+}
+
 export interface PlayerEconomy {
   playerId: string;
   controlledEntityId: string;
   /** Id of this player's mothership (the deploy + zone anchor). */
   motherShipId: string;
   credits: number;
+  /** Active map-ordered course for the mothership, if any. */
+  navTarget?: NavTarget | null;
+  /** Asteroid id claimed by the mothership acting as a rock node. */
+  claimedRockId?: string | null;
+  /** 0..1 progress fabricating one level-1 craft at the rock node. */
+  produceProgress?: number;
+  /** True when the mothership is within mining range of its rock node. */
+  atRockNode?: boolean;
 }
 
 /**
@@ -1128,20 +1230,24 @@ export interface Obstacle {
   r: number;
 }
 
-function maxHpFor(kind: EntityKind, role: FleetRole): number {
+function maxHpFor(kind: EntityKind, role: FleetRole, faction: FactionId): number {
   if (kind === "mother_ship") return MOTHER_SHIP.maxHp;
   if (kind === "fleet_unit") {
-    const def = fleetRoleDef(role);
+    const def = fleetRoleDefFor(faction, role);
     return def ? def.maxHp : FLEET_UNIT.maxHp;
   }
   return SHIP.maxHp;
 }
 
 /** Maximum shield for an entity kind/role (mirrors `maxHpFor`). */
-export function maxShieldFor(kind: EntityKind, role: FleetRole): number {
+export function maxShieldFor(
+  kind: EntityKind,
+  role: FleetRole,
+  faction: FactionId = FACTION_ORDER[0],
+): number {
   if (kind === "mother_ship") return MOTHER_SHIP.maxShield;
   if (kind === "fleet_unit") {
-    const def = fleetRoleDef(role);
+    const def = fleetRoleDefFor(faction, role);
     return def ? def.maxShield : FLEET_UNIT.maxShield;
   }
   return SHIP.maxShield;
@@ -1161,8 +1267,8 @@ export function spawnEntity(
   role: FleetRole = "none",
   faction: FactionId = FACTION_ORDER[0],
 ): EntityState {
-  const maxHp = maxHpFor(kind, role);
-  const maxShield = maxShieldFor(kind, role);
+  const maxHp = maxHpFor(kind, role, faction);
+  const maxShield = maxShieldFor(kind, role, faction);
   return {
     id,
     uid: newUuid("ent"),

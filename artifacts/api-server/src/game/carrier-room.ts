@@ -39,6 +39,7 @@ import {
   TICK_DT,
   TICK_HZ,
   SNAPSHOT_HZ,
+  UNIVERSE,
   ESCORT,
   SHIELD,
   WEAPON,
@@ -56,11 +57,16 @@ import {
   FACTIONS,
   fleetIntent,
   fleetRoleDef,
+  fleetRoleDefFor,
+  platformDefFor,
+  miningFor,
+  FACTION_BUILD,
   forwardVec,
   hash01,
   isDeployableRole,
   isFactionId,
-  isMinerShipType,
+  canMineEntity,
+  MINING,
   makeRng,
   roleShipType,
   randInt,
@@ -116,6 +122,14 @@ interface Player {
   faction: FactionId;
   /** simTick at which this commander actually entered (drives the enemy grace window). */
   joinTick: number;
+  /** Map-ordered mothership course (world coords). */
+  navTarget: { tx: number; ty: number; tz: number; celestialId?: string } | null;
+  /** Asteroid claimed when the mothership arrives ("take the rock"). */
+  claimedRockId: string | null;
+  /** Ticks remaining to finish one level-1 craft at the rock node (0 = idle). */
+  produceTicks: number;
+  /** True when the player manually steered the mothership this tick (pauses nav). */
+  motherManualInput: boolean;
 }
 
 /** Per-enemy bookkeeping kept out of the wire `EntityState`. */
@@ -163,7 +177,7 @@ interface FleetMeta {
 let nextProjectileId = 1;
 
 /** Range (m) within which a miner hull extends an extraction cone onto a rock. */
-const MINING_RANGE = 460;
+const MINING_RANGE = MINING.range;
 /** How many ticks a laser beam stays drawn after a shot is fired. */
 const LASER_SHOW_TICKS = 3;
 /** Drawn length (m) of a free-aimed laser beam. */
@@ -230,6 +244,10 @@ function steerToward(
 
 /** Fleet weapon cooldown expressed in whole ticks. */
 const FLEET_FIRE_COOLDOWN_TICKS = Math.ceil((WEAPON.cooldownMs * 2) / (1000 / TICK_HZ));
+/** Ticks to fabricate one level-1 (miner) craft at a rock node. */
+const MOTHER_PRODUCE_TICKS = Math.max(1, Math.round(CARRIER.motherProduceSec * TICK_HZ));
+/** Level-1 craft role produced by the mothership rock node. */
+const LEVEL1_ROLE: FleetRole = "miner";
 
 export class CarrierRoom {
   private players = new Map<string, Player>();
@@ -275,6 +293,10 @@ export class CarrierRoom {
   private simTick = 0;
   /** Seeded RNG for all fleet randomness (never Math.random). */
   private rng = makeRng(0x5ca1ab1e);
+  /** Last simTick a macro universe event fired (server-driven live ops). */
+  private lastUniverseEventTick = 0;
+  /** Monotonic id for transient event-spawned asteroids. */
+  private nextEventAsteroid = 0;
 
   constructor() {
     this.generateWorld();
@@ -287,30 +309,39 @@ export class CarrierRoom {
     const rng = makeRng(WORLD_SEED);
     const arena = SHIP.arena;
 
-    // Static planets — large gravity anchors.
+    // Large planets — slow orbital anchors spread across the expanded arena.
     for (let i = 0; i < CELESTIAL.planetCount; i++) {
       const radius = randRange(rng, CELESTIAL.planetMinR, CELESTIAL.planetMaxR);
-      const dist = randRange(rng, arena * 0.25, arena * 0.7);
-      const [px, py, pz] = randSphere(rng, dist);
+      const dist = randRange(rng, arena * 0.42, arena * 0.94);
+      const phase = randRange(rng, 0, Math.PI * 2);
+      const py = randRange(rng, -arena * 0.12, arena * 0.12);
+      const px = Math.cos(phase) * dist;
+      const pz = Math.sin(phase) * dist;
       this.celestials.push(
-        this.makeStaticBody("planet", `planet-${i}`, px, py, pz, radius, "gravity", rng),
+        this.makeStaticBody("planet", `planet-${i}`, px, py, pz, radius, "gravity", rng, {
+          orbitR: dist,
+          orbitPhase: phase,
+          orbitPy: py,
+          orbitOmega: randRange(rng, CELESTIAL.orbitOmegaMin, CELESTIAL.orbitOmegaMax),
+          visual: "environment/carrier/solar-system",
+        }),
       );
     }
 
-    // Drifting comets — small push (repulsor) bodies with a long tail of force.
+    // Drifting comets — small push bodies streaking across wide sectors.
     for (let i = 0; i < CELESTIAL.cometCount; i++) {
       const radius = randRange(rng, CELESTIAL.cometMinR, CELESTIAL.cometMaxR);
-      const dist = randRange(rng, arena * 0.2, arena * 0.8);
+      const dist = randRange(rng, arena * 0.3, arena * 0.92);
       const [cx, cy, cz] = randSphere(rng, dist);
       this.celestials.push(
-        this.makeMovingBody("comet", `comet-${i}`, cx, cy, cz, radius, "push", rng),
+        this.makeMovingBody("comet", `comet-${i}`, cx, cy, cz, radius, "push", rng, CELESTIAL.cometRegionHalf),
       );
     }
 
-    // Tumbling asteroids — the mining targets; weak gravity, drift + collide.
+    // Tumbling asteroids — mining nodes scattered through the whole play space.
     for (let i = 0; i < CELESTIAL.asteroidCount; i++) {
       const radius = randRange(rng, CELESTIAL.asteroidMinR, CELESTIAL.asteroidMaxR);
-      const dist = randRange(rng, arena * 0.15, arena * 0.85);
+      const dist = randRange(rng, arena * 0.22, arena * 0.9);
       const [cx, cy, cz] = randSphere(rng, dist);
       this.celestials.push(
         this.makeMovingBody("asteroid", `asteroid-${i}`, cx, cy, cz, radius, "gravity", rng),
@@ -488,6 +519,13 @@ export class CarrierRoom {
     radius: number,
     force: ForceKind,
     rng: Rng,
+    orbit?: {
+      orbitR: number;
+      orbitPhase: number;
+      orbitPy: number;
+      orbitOmega: number;
+      visual?: string;
+    },
   ): CelestialBody {
     return {
       id,
@@ -507,6 +545,11 @@ export class CarrierRoom {
       rcz: pz,
       rhalf: 0,
       seed: randInt(rng, 1, 0x7fffffff),
+      visual: orbit?.visual,
+      orbitR: orbit?.orbitR,
+      orbitPhase: orbit?.orbitPhase,
+      orbitPy: orbit?.orbitPy,
+      orbitOmega: orbit?.orbitOmega,
     };
   }
 
@@ -519,6 +562,7 @@ export class CarrierRoom {
     radius: number,
     force: ForceKind,
     rng: Rng,
+    regionHalf = CELESTIAL.regionHalf,
   ): CelestialBody {
     const speed = randRange(rng, CELESTIAL.moveSpeedMin, CELESTIAL.moveSpeedMax);
     const [vx, vy, vz] = randSphere(rng, speed);
@@ -538,7 +582,7 @@ export class CarrierRoom {
       rcx: px,
       rcy: py,
       rcz: pz,
-      rhalf: CELESTIAL.regionHalf,
+      rhalf: regionHalf,
       seed: randInt(rng, 1, 0x7fffffff),
     };
   }
@@ -624,6 +668,10 @@ export class CarrierRoom {
       joined: false,
       faction: FACTION_ORDER[0],
       joinTick: 0,
+      navTarget: null,
+      claimedRockId: null,
+      produceTicks: 0,
+      motherManualInput: false,
     };
     this.players.set(id, player);
 
@@ -751,7 +799,7 @@ export class CarrierRoom {
     // Defence-in-depth: reject any non-deployable role even if it slipped past
     // the wire decoder, so cost/cap maths can never run with an undefined def.
     if (!isDeployableRole(role)) return false;
-    const def = fleetRoleDef(role);
+    const def = fleetRoleDefFor(p.faction, role);
     if (!def) return false;
 
     const now = Date.now();
@@ -844,7 +892,7 @@ export class CarrierRoom {
   build(id: string, kind: PlatformKind): boolean {
     const p = this.players.get(id);
     if (!p || !p.joined) return false;
-    const def = PLATFORM_DEFS[kind];
+    const def = platformDefFor(p.faction, kind);
     if (!def) return false;
 
     const now = Date.now();
@@ -890,6 +938,163 @@ export class CarrierRoom {
     return true;
   }
 
+  // ─── Strategic navigation + rock-node production ─────────────────────────────
+
+  /**
+   * Order the commander's mothership to navigate to a world point.  When
+   * `celestialId` is set the asteroid is claimed on arrival ("take the rock").
+   */
+  navigate(
+    id: string,
+    tx: number,
+    ty: number,
+    tz: number,
+    celestialId?: string,
+  ): boolean {
+    const p = this.players.get(id);
+    if (!p || !p.joined) return false;
+    const mother = this.entities.get(p.motherShipId);
+    if (!mother || !mother.alive) return false;
+    const a = SHIP.arena;
+    p.navTarget = {
+      tx: clamp(tx, -a, a),
+      ty: clamp(ty, -a * 0.4, a * 0.4),
+      tz: clamp(tz, -a, a),
+      celestialId,
+    };
+    return true;
+  }
+
+  /** Manually queue one level-1 craft at the rock node (if idle + at rock). */
+  produce(id: string): boolean {
+    const p = this.players.get(id);
+    if (!p || !p.joined || p.produceTicks > 0) return false;
+    const mother = this.entities.get(p.motherShipId);
+    if (!mother || !mother.alive) return false;
+    if (!this.motherAtRockNode(p, mother)) return false;
+    if (!this.canDeployRole(p, LEVEL1_ROLE, true)) return false;
+    p.produceTicks = MOTHER_PRODUCE_TICKS;
+    return true;
+  }
+
+  private canDeployRole(p: Player, role: FleetRole, skipCost = false): boolean {
+    if (!isDeployableRole(role)) return false;
+    const def = fleetRoleDefFor(p.faction, role);
+    if (!def) return false;
+    if (!skipCost && p.credits < def.cost) return false;
+    let total = 0;
+    let ofRole = 0;
+    for (const ent of this.entities.values()) {
+      if (ent.kind === "fleet_unit" && ent.owner === p.id) {
+        total++;
+        if (ent.role === role) ofRole++;
+      }
+    }
+    if (total >= CARRIER.maxFleetPerPlayer) return false;
+    if (ofRole >= def.cap) return false;
+    return true;
+  }
+
+  private motherAtRockNode(p: Player, mother: EntityState): boolean {
+    if (p.claimedRockId) {
+      const rock = this.celestials.find((c) => c.id === p.claimedRockId);
+      if (rock) {
+        const dx = rock.px - mother.px;
+        const dy = rock.py - mother.py;
+        const dz = rock.pz - mother.pz;
+        return Math.hypot(dx, dy, dz) < MINING_RANGE + rock.radius + 60;
+      }
+    }
+    const rock = this.nearestRockTo(mother, MINING_RANGE * 1.25);
+    return rock?.kind === "asteroid";
+  }
+
+  private tickMotherNavigation(): void {
+    const MOTHER_NAV_THRUST = 0.42;
+    for (const p of this.players.values()) {
+      if (!p.joined) continue;
+      const mother = this.entities.get(p.motherShipId);
+      if (!mother || !mother.alive) continue;
+
+      this.tickMotherProduction(p, mother);
+
+      const nav = p.navTarget;
+      if (!nav) continue;
+
+      const dx = nav.tx - mother.px;
+      const dy = nav.ty - mother.py;
+      const dz = nav.tz - mother.pz;
+      const dist = Math.hypot(dx, dy, dz);
+
+      if (dist < CARRIER.navArriveDist) {
+        if (nav.celestialId) {
+          const rock = this.celestials.find((c) => c.id === nav.celestialId);
+          if (rock) {
+            p.claimedRockId = rock.id;
+            this.events.push({ k: "reward", px: rock.px, py: rock.py, pz: rock.pz });
+          }
+        }
+        p.navTarget = null;
+        continue;
+      }
+
+      if (p.controlledEntityId === p.motherShipId && p.motherManualInput) continue;
+
+      const cmd = steerToward(mother, nav.tx, nav.ty, nav.tz, MOTHER_NAV_THRUST);
+      stepShip(mother, cmd, TICK_DT);
+    }
+  }
+
+  private tickMotherProduction(p: Player, mother: EntityState): void {
+    if (!this.motherAtRockNode(p, mother)) {
+      p.produceTicks = 0;
+      return;
+    }
+    if (p.produceTicks > 0) {
+      p.produceTicks--;
+      if (p.produceTicks === 0) this.deployFromRockNode(p);
+      return;
+    }
+    if (this.canDeployRole(p, LEVEL1_ROLE, true)) {
+      p.produceTicks = MOTHER_PRODUCE_TICKS;
+    }
+  }
+
+  /** Deploy one level-1 craft from the rock node — no credit cost. */
+  private deployFromRockNode(p: Player): void {
+    const mother = this.entities.get(p.motherShipId);
+    if (!mother || !mother.alive) return;
+    if (!this.canDeployRole(p, LEVEL1_ROLE, true)) return;
+
+    const def = fleetRoleDefFor(p.faction, LEVEL1_ROLE);
+    if (!def) return;
+
+    const jx = (this.rng() * 2 - 1) * 24;
+    const jz = (this.rng() * 2 - 1) * 24;
+    const px = mother.px + jx;
+    const py = mother.py - CARRIER.launchOffset;
+    const pz = mother.pz + jz;
+
+    const uuid = randomUUID();
+    const unit = spawnEntity(uuid, `${def.label}-${uuid.slice(0, 4)}`,
+      "fleet_unit", p.id, mother.team, roleShipType(LEVEL1_ROLE), px, py, pz, mother.yaw, LEVEL1_ROLE,
+      p.faction);
+    unit.zoneR = def.zoneR;
+
+    const ang = this.rng() * Math.PI * 2;
+    const ringR = def.zoneR * 0.6;
+    const offY = (this.rng() * 2 - 1) * def.zoneR * 0.25;
+    this.fleet.set(uuid, {
+      offX: Math.cos(ang) * ringR,
+      offY: offY - def.zoneR * 0.15,
+      offZ: Math.sin(ang) * ringR,
+      lastFireTick: 0,
+    });
+
+    this.refreshZone(unit);
+    logger.info({ id: p.id, role: LEVEL1_ROLE, uuid }, "rock-node craft deployed");
+  }
+
   /** Re-anchor a tethered platform to its mothership at its slot offset. */
   private positionPlatform(plat: PlatformState, mother: EntityState): void {
     const ang = (plat.slot / PLATFORM.maxPerPlayer) * Math.PI * 2;
@@ -915,6 +1120,106 @@ export class CarrierRoom {
     if (!p) return undefined;
     const ms = this.entities.get(p.motherShipId);
     return ms && ms.alive ? ms : undefined;
+  }
+
+  /**
+   * Authoritative universe layer — slow planet orbits plus periodic macro events
+   * that drift fields, surge comets, inject asteroids, or pulse gravity wells.
+   * All motion + events are tick-driven (never wall-clock) for determinism.
+   */
+  private tickUniverse(): void {
+    if (this.simTick - this.lastUniverseEventTick < UNIVERSE.eventIntervalTicks) return;
+    this.lastUniverseEventTick = this.simTick;
+
+    const rng = makeRng(WORLD_SEED ^ (this.simTick * 0x9e3779b1));
+    const phase = Math.floor(this.simTick / UNIVERSE.eventIntervalTicks) % 4;
+    const arena = SHIP.arena;
+
+    switch (phase) {
+      case 0: {
+        for (const b of this.celestials) {
+          if (b.kind === "planet") continue;
+          b.rcx += randRange(rng, -1200, 1200);
+          b.rcy += randRange(rng, -600, 600);
+          b.rcz += randRange(rng, -1200, 1200);
+        }
+        this.events.push({
+          k: "universe",
+          kind: "drift",
+          px: 0,
+          py: 0,
+          pz: 0,
+          msg: "Sector drift — asteroid fields are shifting across the map.",
+        });
+        break;
+      }
+      case 1: {
+        let px = 0, py = 0, pz = 0, n = 0;
+        for (const b of this.celestials) {
+          if (b.kind !== "comet") continue;
+          const boost = randRange(rng, 1.35, 2.4);
+          b.vx *= boost;
+          b.vy *= boost;
+          b.vz *= boost;
+          px += b.px; py += b.py; pz += b.pz;
+          n++;
+        }
+        if (n > 0) { px /= n; py /= n; pz /= n; }
+        this.events.push({
+          k: "universe",
+          kind: "comet_surge",
+          px, py, pz,
+          msg: "Comet surge — repulsor tails are intensifying sector-wide.",
+        });
+        break;
+      }
+      case 2: {
+        const burst = UNIVERSE.spawnBurstCount;
+        for (let i = 0; i < burst; i++) {
+          const radius = randRange(rng, CELESTIAL.asteroidMinR, CELESTIAL.asteroidMaxR);
+          const dist = randRange(rng, arena * 0.35, arena * 0.88);
+          const [cx, cy, cz] = randSphere(rng, dist);
+          const id = `event-asteroid-${this.nextEventAsteroid++}`;
+          this.celestials.push(
+            this.makeMovingBody("asteroid", id, cx, cy, cz, radius, "gravity", rng),
+          );
+        }
+        // Trim oldest event asteroids so the sim stays bounded.
+        const eventBodies = this.celestials.filter((b) => b.id.startsWith("event-asteroid-"));
+        const trim = eventBodies.length - 40;
+        if (trim > 0) {
+          const drop = new Set(eventBodies.slice(0, trim).map((b) => b.id));
+          this.celestials = this.celestials.filter((b) => !drop.has(b.id));
+        }
+        const [ex, ey, ez] = randSphere(rng, arena * 0.5);
+        this.events.push({
+          k: "universe",
+          kind: "asteroid_burst",
+          px: ex, py: ey, pz: ez,
+          msg: `Asteroid burst — ${burst} new rock nodes appeared on the strategic map.`,
+        });
+        break;
+      }
+      case 3: {
+        const planets = this.celestials.filter((b) => b.kind === "planet");
+        const target = planets.length
+          ? planets[randInt(rng, 0, planets.length - 1)]
+          : null;
+        if (target) {
+          target.mass = target.radius * randRange(rng, 1.6, 2.8);
+          target.forceRadius = target.radius * CELESTIAL.forceReachMult * 1.35;
+          this.events.push({
+            k: "universe",
+            kind: "gravity_pulse",
+            px: target.px,
+            py: target.py,
+            pz: target.pz,
+            msg: `Gravity pulse near ${target.id} — approach with caution.`,
+          });
+        }
+        break;
+      }
+    }
   }
 
   // ─── Simulation tick ─────────────────────────────────────────────────────────
@@ -948,17 +1253,32 @@ export class CarrierRoom {
     }
 
     // Credit accrual — deterministic, per fixed tick (no wall-clock).  Each live
-    // production platform adds a flat bonus to its owner's rate.
+    // production platform adds a flat bonus to its owner's rate; miner hulls
+    // earn extra while locked onto an asteroid.
     for (const p of this.players.values()) {
       if (!p.joined) continue;
       let rate = CARRIER.creditRatePerSec;
+      const build = FACTION_BUILD[p.faction];
       for (const plat of this.platforms.values()) {
         if (plat.owner === p.id && plat.kind === "production") {
-          rate += PLATFORM.productionBonusPerSec;
+          rate += build.productionBonusPerSec;
         }
+      }
+      for (const e of this.entities.values()) {
+        if (!e.alive || e.owner !== p.id) continue;
+        const mine = miningFor(e.faction);
+        const canMine = canMineEntity(e)
+          || (e.kind === "mother_ship" && this.motherAtRockNode(p, e));
+        if (!canMine) continue;
+        const rock = this.nearestRockTo(e, mine.range * (e.kind === "mother_ship" ? 1.25 : 1));
+        if (rock?.kind === "asteroid") rate += mine.creditPerSec;
       }
       p.credits += rate * TICK_DT;
     }
+
+    // Mothership map navigation + rock-node production (before player input).
+    for (const p of this.players.values()) p.motherManualInput = false;
+    this.tickMotherNavigation();
 
     // Fleet AI: deterministic server-side intent → shared integrator.
     this.tickFleet(now);
@@ -980,12 +1300,19 @@ export class CarrierRoom {
         const dt = Math.max(0, Math.min(0.05, cmd.dt));
         stepShip(entity, cmd, dt);
         p.lastSeq = cmd.seq;
+        if (
+          entity.id === p.motherShipId
+          && (Math.abs(cmd.thrust) > 0.05 || Math.abs(cmd.yaw) > 0.05 || Math.abs(cmd.pitch) > 0.05)
+        ) {
+          p.motherManualInput = true;
+        }
         if (cmd.fire) this.tryFire(entity, p.id, now, () => p.lastFireAt, (t) => { p.lastFireAt = t; });
         if (cmd.missile) this.tryMissile(entity, p.id, now, () => p.lastMissileAt, (t) => { p.lastMissileAt = t; });
       }
     }
 
-    // Celestial motion + body-on-body collisions.
+    // Server-driven universe ops (orbits, macro events) then body integration.
+    this.tickUniverse();
     for (const b of this.celestials) stepCelestial(b, TICK_DT);
     for (const hit of resolveCelestialCollisions(this.celestials)) {
       this.events.push({ k: "impact", px: hit.px, py: hit.py, pz: hit.pz });
@@ -1331,10 +1658,10 @@ export class CarrierRoom {
           });
       stepShip(unit, intent, TICK_DT);
 
-      const def = fleetRoleDef(unit.role);
+      const def = fleetRoleDefFor(unit.faction, unit.role);
       if (intent.fire && def && def.armed &&
           this.simTick - meta.lastFireTick >=
-            fleetFireCooldownTicks(unit.role, FLEET_FIRE_COOLDOWN_TICKS)) {
+            fleetFireCooldownTicks(unit.role, FLEET_FIRE_COOLDOWN_TICKS, unit.faction)) {
         meta.lastFireTick = this.simTick;
         this.spawnProjectile(unit, unit.owner, now);
       }
@@ -1447,13 +1774,17 @@ export class CarrierRoom {
           this.firePlatformBolt(plat, mother, target.px, target.py, target.pz, now);
         }
       } else if (plat.kind === "utility") {
+        const owner = this.players.get(plat.owner);
+        const repair = owner
+          ? FACTION_BUILD[owner.faction].utilityRepairPerSec
+          : PLATFORM.utilityRepairPerSec;
         const r2 = PLATFORM.utilityRange * PLATFORM.utilityRange;
         for (const ent of this.entities.values()) {
           if (!ent.alive || ent.owner !== plat.owner) continue;
           if (ent.hp >= ent.maxHp) continue;
           const dx = ent.px - plat.px, dy = ent.py - plat.py, dz = ent.pz - plat.pz;
           if (dx * dx + dy * dy + dz * dz <= r2) {
-            ent.hp = Math.min(ent.maxHp, ent.hp + PLATFORM.utilityRepairPerSec * TICK_DT);
+            ent.hp = Math.min(ent.maxHp, ent.hp + repair * TICK_DT);
           }
         }
       }
@@ -1699,8 +2030,10 @@ export class CarrierRoom {
       const mz = e.pz + fz * WEAPON.muzzleForward;
 
       // Mining cone → nearest harvestable rock in range.
-      if (isMinerShipType(e.shipType)) {
-        const rock = this.nearestRockTo(e, MINING_RANGE);
+      const owner = e.owner ? this.players.get(e.owner) : undefined;
+      const motherMining = e.kind === "mother_ship" && owner && this.motherAtRockNode(owner, e);
+      if (canMineEntity(e) || motherMining) {
+        const rock = this.nearestRockTo(e, motherMining ? MINING_RANGE * 1.25 : MINING_RANGE);
         if (rock) {
           const dx = e.px - rock.px, dy = e.py - rock.py, dz = e.pz - rock.pz;
           const d = Math.hypot(dx, dy, dz) || 1;
@@ -2003,11 +2336,20 @@ export class CarrierRoom {
     const economy: PlayerEconomy[] = [];
     for (const p of this.players.values()) {
       if (!p.joined) continue;
+      const mother = this.entities.get(p.motherShipId);
+      const atRockNode = mother && mother.alive ? this.motherAtRockNode(p, mother) : false;
+      const produceProgress = p.produceTicks > 0
+        ? 1 - p.produceTicks / MOTHER_PRODUCE_TICKS
+        : 0;
       economy.push({
         playerId: p.id,
         controlledEntityId: p.controlledEntityId,
         motherShipId: p.motherShipId,
         credits: Math.floor(p.credits),
+        navTarget: p.navTarget,
+        claimedRockId: p.claimedRockId,
+        produceProgress,
+        atRockNode,
       });
     }
 

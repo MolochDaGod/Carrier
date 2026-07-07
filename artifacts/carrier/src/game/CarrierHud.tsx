@@ -9,8 +9,10 @@ import {
   PLATFORM_COLORS,
   ROLE_COLORS,
   type CarrierHudState,
+  type FleetHullPhase,
   type MapBlip,
 } from "./constants";
+import { fleetDebug, hullPhaseColor } from "./fleetDebug";
 import type { FleetRole, PlatformKind } from "@workspace/carrier-net";
 import { FactionEmblem } from "../components/FactionEmblem";
 import {
@@ -51,6 +53,8 @@ export function CarrierHud({
   onBecome,
   onSummon,
   onBuild,
+  onNavigate,
+  onProduce,
   onSkipIntro,
 }: {
   state: CarrierHudState;
@@ -59,13 +63,32 @@ export function CarrierHud({
   onBecome: (entityId: string) => void;
   onSummon: (entityId: string) => void;
   onBuild: (kind: PlatformKind) => void;
+  onNavigate: (blip: MapBlip) => void;
+  onProduce: () => void;
   onSkipIntro: () => void;
 }) {
   const [tab, setTab] = useState<"fleet" | "build">("fleet");
   const [mapOpen, setMapOpen] = useState(false);
+
+  // Backtick (`) toggles wired fleet hull diagnostics.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "Backquote" || e.repeat) return;
+      const el = document.activeElement;
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return;
+      fleetDebug.toggle();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const hpPct = Math.max(0, Math.min(1, state.hp / state.maxHp)) * 100;
   const online = state.status === "connected";
   const factionColor = state.faction?.color ?? "#00d4ff";
+  const fleetDebugOn = useSyncExternalStore(
+    (cb) => fleetDebug.subscribe(cb),
+    () => fleetDebug.enabled,
+  );
+  const showFleetDebug = fleetDebugOn || state.fleetDebug.enabled;
 
   // M toggles the strategic map (ignored while typing in a field).
   useEffect(() => {
@@ -383,7 +406,7 @@ export function CarrierHud({
                     e.preventDefault();
                     if (u.summonable) onSummon(u.id);
                   }}
-                  className={`flex items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors ${
+                  className={`flex items-start gap-2 rounded border px-2 py-1.5 text-left transition-colors ${
                     active
                       ? "cursor-default border-[#00d4ff] bg-[#00d4ff]/15"
                       : u.escorting
@@ -400,17 +423,24 @@ export function CarrierHud({
                           : `Fly ${u.label} (LMB)`
                   }
                 >
-                  <span style={{ color: accent }}>{ROSTER_ICON[u.kind] ?? "●"}</span>
-                  <span className="flex-1 truncate text-[11px] text-white/85">
-                    {u.label}
-                  </span>
-                  {u.escorting && (
-                    <span className="text-[8px] uppercase tracking-wider text-[#66ccff]">
-                      ESC
+                  <span className="mt-0.5" style={{ color: accent }}>{ROSTER_ICON[u.kind] ?? "●"}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="truncate text-[11px] font-medium text-white/90">
+                        {u.label}
+                      </span>
+                      {u.escorting && (
+                        <span className="text-[8px] uppercase tracking-wider text-[#66ccff]">
+                          ESC
+                        </span>
+                      )}
+                      {active && (
+                        <span className="text-[8px] uppercase tracking-wider text-[#00d4ff]">
+                          ●
+                        </span>
+                      )}
                     </span>
-                  )}
-                  <span className="flex flex-col gap-0.5">
-                    <span className="h-1 w-8 overflow-hidden rounded-full bg-white/15">
+                    <span className="mt-1 block h-1.5 w-full overflow-hidden rounded-full bg-white/15">
                       <span
                         className="block h-full rounded-full"
                         style={{
@@ -419,20 +449,13 @@ export function CarrierHud({
                         }}
                       />
                     </span>
-                    {u.shieldPct > 0 && (
-                      <span className="h-0.5 w-8 overflow-hidden rounded-full bg-white/15">
-                        <span
-                          className="block h-full rounded-full bg-[#66ccff]"
-                          style={{ width: `${u.shieldPct * 100}%` }}
-                        />
-                      </span>
-                    )}
-                  </span>
-                  {active && (
-                    <span className="text-[8px] uppercase tracking-wider text-[#00d4ff]">
-                      ●
+                    <span className="mt-0.5 block h-1 w-full overflow-hidden rounded-full bg-white/10">
+                      <span
+                        className="block h-full rounded-full bg-[#66ccff]"
+                        style={{ width: `${Math.max(u.shieldPct, 0.04) * 100}%`, opacity: u.shieldPct > 0 ? 1 : 0.25 }}
+                      />
                     </span>
-                  )}
+                  </span>
                 </button>
               );
             })}
@@ -533,6 +556,7 @@ export function CarrierHud({
           color={factionColor}
           missile={state.firingMissile}
           firing={state.firingPrimary}
+          aim={state.aimScreen}
         />
       )}
 
@@ -625,9 +649,16 @@ export function CarrierHud({
                     <div
                       key={u.id}
                       className="flex items-center gap-1 rounded border border-white/10 bg-white/5 px-1.5 py-0.5"
-                      title={`${u.label} · ${Math.round(u.hpPct * 100)}% hull`}
+                      title={fleetChipTitle(u)}
                     >
                       <span className="h-1.5 w-1.5 rounded-full" style={{ background: ROLE_COLORS[u.role] }} />
+                      {(showFleetDebug || u.hullPhase !== "glb") && (
+                        <span
+                          className="h-1.5 w-1.5 rounded-full ring-1 ring-black/40"
+                          style={{ background: hullPhaseColor(u.hullPhase) }}
+                          title={`Hull: ${u.hullPhase}`}
+                        />
+                      )}
                       <span className="text-[9px] text-white/70">{u.label}</span>
                       <span className="h-1 w-6 overflow-hidden rounded-full bg-white/15">
                         <span className="block h-full rounded-full" style={{ width: `${u.hpPct * 100}%`, background: ROLE_COLORS[u.role] }} />
@@ -690,15 +721,169 @@ export function CarrierHud({
         </div>
       )}
 
+      {/* Server universe event */}
+      {online && state.universeEvent && (
+        <div className="pointer-events-none absolute left-1/2 top-24 w-[min(92vw,32rem)] -translate-x-1/2 rounded-md border border-[#9b59ff]/45 bg-black/70 px-3 py-2 text-center text-xs backdrop-blur-sm">
+          <div className="text-[10px] uppercase tracking-[0.25em] text-[#9b59ff]/80">
+            Universe event · {state.universeEvent.kind.replace(/_/g, " ")}
+          </div>
+          <div className="mt-1 text-white/85">{state.universeEvent.msg}</div>
+        </div>
+      )}
+
+      {/* Mothership mission strip */}
+      {online && (state.motherMission.navActive || state.motherMission.atRockNode) && (
+        <div className="pointer-events-auto absolute left-1/2 top-14 w-[min(92vw,28rem)] -translate-x-1/2 rounded-md border border-[#00d4ff]/35 bg-black/60 px-3 py-2 text-xs backdrop-blur-sm">
+          <div className="flex items-center justify-between gap-2">
+            <span className="uppercase tracking-widest text-[#00d4ff]/80">
+              {state.motherMission.navActive ? "Carrier en route" : "Rock node active"}
+            </span>
+            {state.motherMission.atRockNode && (
+              <button
+                onClick={onProduce}
+                className="rounded border border-[#ffd23f]/50 px-2 py-0.5 text-[10px] uppercase tracking-wider text-[#ffd23f] hover:bg-[#ffd23f]/10"
+              >
+                Build miner
+              </button>
+            )}
+          </div>
+          {state.motherMission.navActive && state.motherMission.navLabel && (
+            <div className="mt-0.5 text-white/70">Mission: {state.motherMission.navLabel}</div>
+          )}
+          {state.motherMission.atRockNode && state.motherMission.produceProgress > 0 && (
+            <div className="mt-1.5">
+              <div className="mb-0.5 flex justify-between text-[10px] text-white/50">
+                <span>Fabricating L1 craft</span>
+                <span>{Math.round(state.motherMission.produceProgress * 100)}%</span>
+              </div>
+              <div className="h-1 overflow-hidden rounded-full bg-white/15">
+                <div
+                  className="h-full rounded-full bg-[#ffd23f]"
+                  style={{ width: `${state.motherMission.produceProgress * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Strategic map overlay */}
       {online && mapOpen && (
-        <StrategicMap blips={state.mapBlips} onClose={() => setMapOpen(false)} />
+        <StrategicMap
+          blips={state.mapBlips}
+          onClose={() => setMapOpen(false)}
+          onNavigate={(blip) => {
+            onNavigate(blip);
+            setMapOpen(false);
+          }}
+        />
+      )}
+
+      {online && showFleetDebug && (
+        <FleetDebugPanel panel={state.fleetDebug} />
+      )}
+
+      {/* Hull yaw tune feedback (numpad 4 / 6 / 5) */}
+      {online && (state.hullTuneDeg !== null || state.hullTuneSaved) && (
+        <div className="pointer-events-none absolute bottom-24 right-5 max-w-xs rounded-md border border-[#ffd23f]/40 bg-black/70 px-3 py-2 text-right text-[10px] backdrop-blur-sm">
+          {state.hullTuneSaved ? (
+            <div className="text-[#2bd96b]">{state.hullTuneSaved}</div>
+          ) : state.hullTuneDeg !== null ? (
+            <>
+              <div className="uppercase tracking-widest text-[#ffd23f]/80">Hull yaw tune</div>
+              <div className="tabular-nums text-white/85">{state.hullTuneDeg.toFixed(1)}°</div>
+              <div className="text-white/45">Num4 ← · Num6 → · Num5 save</div>
+            </>
+          ) : null}
+        </div>
       )}
 
       {/* Controls hint */}
       <div className="absolute bottom-5 right-5 text-right text-[10px] leading-relaxed text-white/40">
         <div>W/S throttle · A/D yaw · ↑/↓ pitch · Q/E roll</div>
         <div>Mouse aim (click to lock) · LMB/Space fire · RMB missiles · Shift boost · Tab carrier↔ship</div>
+        <div>Num4/6 hull yaw · Num5 save orientation</div>
+        {showFleetDebug && (
+          <div className="mt-1 text-[#ffd23f]/70">` fleet debug · green=GLB · amber=pending · orange=fallback</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function fleetChipTitle(u: {
+  label: string;
+  hpPct: number;
+  hullPhase: FleetHullPhase;
+  hullAssetId: string;
+  hullError?: string;
+}): string {
+  const lines = [
+    `${u.label} · ${Math.round(u.hpPct * 100)}% hull`,
+    `Hull: ${u.hullPhase} · ${u.hullAssetId}`,
+  ];
+  if (u.hullError) lines.push(u.hullError);
+  return lines.join("\n");
+}
+
+function FleetDebugPanel({ panel }: { panel: CarrierHudState["fleetDebug"] }) {
+  const phaseLabel: Record<FleetHullPhase, string> = {
+    glb: "GLB",
+    pending: "…",
+    fallback: "CONE",
+    error: "ERR",
+  };
+  return (
+    <div className="pointer-events-auto absolute right-5 top-14 z-20 w-72 max-h-[50vh] overflow-hidden rounded-md border border-[#ffd23f]/30 bg-black/75 text-[10px] backdrop-blur-sm">
+      <div className="flex items-center justify-between border-b border-white/10 px-2.5 py-2">
+        <span className="font-semibold uppercase tracking-[0.2em] text-[#ffd23f]">Fleet Debug</span>
+        <span className="tabular-nums text-white/45">
+          {panel.glb}✓ {panel.pending}… {panel.fallback}△ {panel.error}✕
+        </span>
+      </div>
+      <div className="border-b border-white/10 px-2.5 py-1.5 text-[9px] text-white/40">
+        <div className="flex justify-between gap-2">
+          <span>
+            Queue {panel.loadQueue.inFlight}/{panel.loadQueue.maxConcurrency}
+            {panel.loadQueue.queued > 0 ? ` · ${panel.loadQueue.queued} wait` : ""}
+          </span>
+          <span className="tabular-nums">
+            {panel.loadQueue.completed}↓ {panel.loadQueue.failed > 0 ? `${panel.loadQueue.failed}✕` : ""}
+          </span>
+        </div>
+        <div>
+          Warmup {panel.warmupPhase}
+          {panel.cdn ? " · CDN" : " · bundle"}
+        </div>
+      </div>
+      <div className="max-h-[40vh] overflow-y-auto px-2 py-1.5 font-mono">
+        {panel.rows.length === 0 ? (
+          <div className="py-3 text-center text-white/35">Deploy a unit to trace hull loads</div>
+        ) : (
+          panel.rows.map((r) => (
+            <div
+              key={r.key}
+              className="border-b border-white/5 py-1.5 last:border-0"
+              title={r.error ?? r.assetId}
+            >
+              <div className="flex items-center gap-1.5">
+                <span
+                  className="rounded px-1 py-0.5 text-[8px] font-bold uppercase"
+                  style={{ background: `${hullPhaseColor(r.phase)}33`, color: hullPhaseColor(r.phase) }}
+                >
+                  {phaseLabel[r.phase]}
+                </span>
+                <span className="truncate text-white/80">{r.label}</span>
+                {r.skinned && <span className="text-[8px] text-[#c084fc]">rig</span>}
+                {r.durationMs != null && (
+                  <span className="ml-auto tabular-nums text-white/35">{r.durationMs}ms</span>
+                )}
+              </div>
+              <div className="truncate pl-1 text-[9px] text-white/35">{r.assetId}</div>
+              {r.error && <div className="truncate pl-1 text-[9px] text-[#ff9d3f]">{r.error}</div>}
+            </div>
+          ))
+        )}
       </div>
     </div>
   );
@@ -765,9 +950,11 @@ function AudioControl() {
 function StrategicMap({
   blips,
   onClose,
+  onNavigate,
 }: {
   blips: MapBlip[];
   onClose: () => void;
+  onNavigate: (blip: MapBlip) => void;
 }) {
   const SIZE = 460;
   const toPx = (v: number) => ((v + 1) / 2) * SIZE;
@@ -805,16 +992,28 @@ function StrategicMap({
         {blips.map((b, i) => {
           const big = b.kind === "self" || b.kind === "carrier";
           const outpost = b.kind === "outpost";
+          const rock = b.kind === "rock";
+          const system = b.kind === "system";
+          const clickable = b.mission || b.kind === "rock" || b.kind === "outpost" || system;
           return (
             <circle
-              key={i}
+              key={b.id ?? i}
               cx={toPx(b.x)}
               cy={toPx(b.y)}
-              r={big ? 5 : outpost ? 4.5 : b.kind === "enemy" ? 3.5 : 2.5}
+              r={big ? 5 : system ? 5.5 : outpost ? 4.5 : rock ? (b.mission ? 4 : 3) : b.kind === "enemy" ? 3.5 : 2.5}
               fill={outpost ? "none" : b.color}
-              stroke={b.kind === "self" ? "#ffffff" : outpost ? b.color : "none"}
-              strokeWidth={b.kind === "self" ? 1.5 : outpost ? 1.5 : 0}
-            />
+              stroke={b.mission ? "#ffd23f" : b.kind === "self" ? "#ffffff" : outpost || rock ? b.color : "none"}
+              strokeWidth={b.mission ? 2 : b.kind === "self" ? 1.5 : outpost || rock ? 1.2 : 0}
+              opacity={rock ? 0.85 : 1}
+              className={clickable ? "cursor-pointer hover:opacity-100" : undefined}
+              onClick={() => {
+                if (clickable) onNavigate(b);
+              }}
+            >
+              {b.mission && (
+                <title>{`Take ${b.label ?? "rock"} — click to order carrier`}</title>
+              )}
+            </circle>
           );
         })}
       </svg>
@@ -825,7 +1024,14 @@ function StrategicMap({
         <Legend color="#ff6b35" label="Platform" />
         <Legend color="#ff3b30" label="Enemy" />
         <Legend color="#ffd23f" label="Reward" />
+        <Legend color="#5a9fd4" label="Solar system" />
+        <Legend color="#8a7f72" label="Asteroid" />
+        <Legend color="#ffd23f" label="Mission target" />
+        <Legend color="#2bd96b" label="Claimed" />
         <Legend color="#2bd96b" label="Outpost" />
+      </div>
+      <div className="mt-1 text-center text-[9px] text-white/40">
+        Click an asteroid to order the carrier · M to close
       </div>
     </div>
   );
@@ -836,10 +1042,12 @@ function CombatCrosshair({
   color,
   missile,
   firing,
+  aim,
 }: {
   color: string;
   missile: boolean;
   firing: boolean;
+  aim: { x: number; y: number } | null;
 }) {
   const accent = missile ? "#ff8844" : color;
   const spread = firing ? 6 : missile ? 4 : 0;
@@ -847,8 +1055,11 @@ function CombatCrosshair({
   const arm = 9;
   const gap = 5;
   const style = { borderColor: accent, boxShadow: `0 0 8px ${accent}55` };
+  const posStyle = aim
+    ? { left: `${aim.x * 100}%`, top: `${aim.y * 100}%`, transform: "translate(-50%, -50%)" }
+    : { left: "50%", top: "50%", transform: "translate(-50%, -50%)" };
   return (
-    <div className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
+    <div className="pointer-events-none absolute" style={posStyle}>
       <div className="relative" style={{ width: sz * 2, height: sz * 2 }}>
         <span className="absolute border-l-2 border-t-2" style={{ ...style, left: 0, top: 0, width: arm, height: arm }} />
         <span className="absolute border-r-2 border-t-2" style={{ ...style, right: 0, top: 0, width: arm, height: arm }} />

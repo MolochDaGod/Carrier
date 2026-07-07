@@ -6,7 +6,8 @@
  * self-respawning there is no local restart; "Leave" returns to the home screen.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FACTIONS, FACTION_ORDER, type FactionId } from "@workspace/carrier-net";
+import { FACTIONS, FACTION_ORDER, SHIP, type FactionId } from "@workspace/carrier-net";
+import type { MapBlip } from "./constants";
 import { CarrierGame } from "./CarrierGame";
 import { CarrierHud } from "./CarrierHud";
 import { type CarrierHudState } from "./constants";
@@ -110,6 +111,13 @@ export function CarrierLauncher({ onExit }: { onExit: () => void }) {
           onBecome={(id) => engineRef.current?.become(id)}
           onSummon={(id) => engineRef.current?.summon(id)}
           onBuild={(kind) => engineRef.current?.build(kind)}
+          onNavigate={(blip: MapBlip) => {
+            const tx = blip.x * SHIP.arena;
+            const tz = blip.y * SHIP.arena;
+            const ty = 0;
+            engineRef.current?.navigate(tx, ty, tz, blip.id);
+          }}
+          onProduce={() => engineRef.current?.produce()}
           onSkipIntro={() => engineRef.current?.skipCinematic()}
         />
       )}
