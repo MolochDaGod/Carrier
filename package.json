@@ -9,12 +9,7 @@
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
   },
   "private": true,
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "@swc/core"
-    ]
-  },
+  "packageManager": "pnpm@9.15.9",
   "devDependencies": {
     "prettier": "^3.8.3",
     "typescript": "~5.9.3"
