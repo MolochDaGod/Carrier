@@ -59,3 +59,12 @@ export {
   resolveAssetUrl,
   tryResolveAssetUrl,
 } from "./urls.js";
+
+export {
+  getLoadConcurrency,
+  getLoadQueueStats,
+  isCdnPreferred,
+  noteLoadQueueEvent,
+  resetLoadQueueStats,
+  setLoadConcurrency,
+} from "./loadQueue.js";

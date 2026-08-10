@@ -18,6 +18,7 @@ import {
   armorFor,
   fleetRoleDef,
   forwardVec,
+  motherAegisRadius,
   speedMultFor,
   tunablesFor,
   type CelestialBody,
@@ -290,6 +291,37 @@ export function damageEntity(e: EntityState, amount: number): number {
   return rem;
 }
 
+/** Distance between two entities (m). */
+export function entityDist(a: Pick<EntityState, "px" | "py" | "pz">, b: Pick<EntityState, "px" | "py" | "pz">): number {
+  const dx = a.px - b.px, dy = a.py - b.py, dz = a.pz - b.pz;
+  return Math.hypot(dx, dy, dz);
+}
+
+/**
+ * Friendly mothership whose aegis zone covers `e` (same team/owner).
+ * Zone radius = motherAegisRadius() (5× mothership hull length).
+ * Mothers do not aegis themselves (no self-stack).
+ */
+export function friendlyAegisMother(
+  e: EntityState,
+  mothers: Iterable<EntityState>,
+): EntityState | null {
+  if (!e.alive || e.kind === "mother_ship") return null;
+  const r = motherAegisRadius();
+  let best: EntityState | null = null;
+  let bestD = r;
+  for (const m of mothers) {
+    if (!m.alive || m.kind !== "mother_ship") continue;
+    if (m.team !== e.team && m.owner !== e.owner) continue;
+    const d = entityDist(e, m);
+    if (d <= r && d <= bestD) {
+      best = m;
+      bestD = d;
+    }
+  }
+  return best;
+}
+
 /** Physical collision radius (m) for an entity kind/role. */
 export function collideRadius(e: EntityState): number {
   if (e.kind === "mother_ship") return 120;
@@ -453,6 +485,7 @@ const ZERO_CMD: InputCommand = {
   roll: 0,
   boost: false,
   fire: false,
+  missile: false,
 };
 
 function len(x: number, y: number, z: number): number {
@@ -548,6 +581,7 @@ export function fleetIntent(unit: EntityState, ctx: FleetContext): InputCommand 
     roll: 0,
     boost: false,
     fire,
+    missile: false,
   };
 }
 
@@ -705,5 +739,6 @@ export function escortIntent(unit: EntityState, ctx: EscortContext): InputComman
     roll: 0,
     boost,
     fire,
+    missile: false,
   };
 }

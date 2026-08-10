@@ -11,7 +11,11 @@
  */
 
 import { newUuid } from "./uuid";
-import { factionFleetShip, fleetRoleDefFor } from "./factionRoster";
+import {
+  factionFleetShip,
+  fleetRoleDefFor,
+  statCardForFactionRole,
+} from "./factionRoster";
 
 export {
   FACTION_BUILD,
@@ -137,30 +141,96 @@ export const ESCORT = {
   formationR: 130,
 } as const;
 
+/**
+ * Primary fire — casting-lab fire laser profile: quick cadence, high bolt
+ * speed, short travel so the beam VFX (client) reads as a laser rather than a
+ * slow slug. Role hulls override cadence/damage via `ROLE_ATTACK` + ATTACK mult.
+ * Origin inspiration: casting.grudge-studio.com fire / beam skills.
+ */
 export const WEAPON = {
-  cooldownMs: 180,
-  projectileSpeed: 320,
-  projectileLifeMs: 1600,
+  /** Faster than legacy 180 ms — laser pulse feel. */
+  cooldownMs: 90,
+  /** High speed so bolts read as near-hitscan laser pulses. */
+  projectileSpeed: 560,
+  /** Short life; visual laser beam is the main cue. */
+  projectileLifeMs: 850,
+  /** Baseline fighter bolt damage (roles scale via attack profile + damageMult). */
   damage: 12,
-  hitRadius: 9,
+  hitRadius: 11,
   muzzleForward: 6,
 } as const;
+
+/**
+ * Attack style — drives damage feel, projectile flight, and client VFX.
+ * Role profiles live next to FLEET_ROLES (`ROLE_ATTACK`).
+ */
+export type AttackStyle =
+  | "laser"
+  | "pulse"
+  | "plasma"
+  | "flak"
+  | "rail"
+  | "beam";
+
+/** Per-shot attack profile (before ATTACK-stat damageMult). */
+export interface AttackProfile {
+  style: AttackStyle;
+  /** Base damage per bolt before combatProfile.damageMult. */
+  damage: number;
+  cooldownMs: number;
+  projectileSpeed: number;
+  projectileLifeMs: number;
+  hitRadius: number;
+  /** Optional splash (m) on impact — flak / plasma burst. */
+  splashRadius: number;
+}
+
+/**
+ * Friendly mothership forcefield (aegis) zone.
+ * Radius = hull length × radiusMul. Hull length matches client
+ * `SHIP_FIT * MOTHER_SHIP.scaleFactor` (40 m × 8 = 320 m).
+ * Inside a friendly carrier's zone: pilot maxShield × shieldMul; after
+ * outOfCombatMs without taking damage, shield fully recharges over regenOverMs.
+ */
+export const MOTHER_AEGIS = {
+  /** Mother hull length (m) for zone sizing — keep in sync with client SHIP_FIT×scale. */
+  hullLengthM: 320,
+  /** Zone radius = hullLengthM × this (user: 5× ship size). */
+  radiusMul: 5,
+  /** Effective maxShield multiplier while inside friendly aegis. */
+  shieldMul: 3,
+  /** Quiet time (ms) after last damage before fast full regen starts. */
+  outOfCombatMs: 10_000,
+  /** Full shield refill duration (ms) under aegis when out of combat. */
+  regenOverMs: 5_000,
+} as const;
+
+/** World-space aegis radius (m). */
+export function motherAegisRadius(): number {
+  return MOTHER_AEGIS.hullLengthM * MOTHER_AEGIS.radiusMul;
+}
 
 /** Player-fired homing missiles (RMB / secondary). Slower but heavier + guided. */
 export const MISSILE = {
   cooldownMs: 1100,
   projectileSpeed: 195,
   projectileLifeMs: 4200,
-  damage: 34,
+  /** Heavier strike — pairs with primary laser for capital pressure. */
+  damage: 42,
   hitRadius: 16,
   muzzleForward: 10,
   /** How aggressively velocity steers toward the nearest hostile (1/s). */
   homingStrength: 4.2,
   /** Splash radius on detonation (m) — damages all hostiles in range once. */
-  splashRadius: 42,
+  splashRadius: 48,
 } as const;
 
+/**
+ * Wire projectile kind. Combat bolts share `"bolt"`; style rides in
+ * `ProjectileState.style` for client VFX. Missiles remain guided secondaries.
+ */
 export type ProjectileKind = "bolt" | "missile";
+export type ProjectileStyle = AttackStyle | "missile";
 
 export const SHIP_TYPES = 6;
 
@@ -572,7 +642,10 @@ export const CARRIER = {
   launchOffset: 40,
   /** Minimum ms a player must wait between two deploys. */
   deployCooldownMs: 600,
-  /** Seconds to fabricate one level-1 craft when the mothership is at a rock node. */
+  /**
+   * Seconds to fabricate the next faction fleet hull at a rock node.
+   * Rock production cycles every deployable role (not miner-only).
+   */
   motherProduceSec: 8,
   /** Arrival distance (m) for a map-ordered mothership course. */
   navArriveDist: 140,
@@ -729,6 +802,144 @@ export const FLEET_ROLES: Record<Exclude<FleetRole, "none">, FleetRoleDef> = {
   },
 };
 
+/**
+ * Class attack styles + tuned damage. Miner beam is non-combat (mining only);
+ * combat roles escalate laser → pulse → flak → plasma → rail.
+ */
+export const ROLE_ATTACK: Record<Exclude<FleetRole, "none">, AttackProfile> = {
+  miner: {
+    style: "beam",
+    damage: 0,
+    cooldownMs: 0,
+    projectileSpeed: 0,
+    projectileLifeMs: 0,
+    hitRadius: 0,
+    splashRadius: 0,
+  },
+  scout: {
+    style: "laser",
+    damage: 9,
+    cooldownMs: 70,
+    projectileSpeed: 620,
+    projectileLifeMs: 700,
+    hitRadius: 10,
+    splashRadius: 0,
+  },
+  corsair: {
+    style: "pulse",
+    damage: 14,
+    cooldownMs: 95,
+    projectileSpeed: 520,
+    projectileLifeMs: 900,
+    hitRadius: 12,
+    splashRadius: 8,
+  },
+  frigate: {
+    style: "flak",
+    damage: 11,
+    cooldownMs: 110,
+    projectileSpeed: 400,
+    projectileLifeMs: 1100,
+    hitRadius: 18,
+    splashRadius: 28,
+  },
+  cruiser: {
+    style: "plasma",
+    damage: 22,
+    cooldownMs: 140,
+    projectileSpeed: 380,
+    projectileLifeMs: 1400,
+    hitRadius: 14,
+    splashRadius: 22,
+  },
+  dreadnought: {
+    style: "rail",
+    damage: 36,
+    cooldownMs: 220,
+    projectileSpeed: 780,
+    projectileLifeMs: 1600,
+    hitRadius: 13,
+    splashRadius: 12,
+  },
+};
+
+/** Fighter primary attack (casting fire laser). */
+export const FIGHTER_ATTACK: AttackProfile = {
+  style: "laser",
+  damage: WEAPON.damage,
+  cooldownMs: WEAPON.cooldownMs,
+  projectileSpeed: WEAPON.projectileSpeed,
+  projectileLifeMs: WEAPON.projectileLifeMs,
+  hitRadius: WEAPON.hitRadius,
+  splashRadius: 0,
+};
+
+/** Capital primary attack (plasma battery). */
+export const MOTHER_ATTACK: AttackProfile = {
+  style: "plasma",
+  damage: 18,
+  cooldownMs: 120,
+  projectileSpeed: 480,
+  projectileLifeMs: 1000,
+  hitRadius: 14,
+  splashRadius: 16,
+};
+
+/** Resolve attack profile for an entity (role-aware for fleet units). */
+export function attackProfileFor(
+  kind: EntityKind,
+  role: FleetRole,
+): AttackProfile {
+  if (kind === "mother_ship") return MOTHER_ATTACK;
+  if (kind === "fleet_unit" && role !== "none" && Object.hasOwn(ROLE_ATTACK, role)) {
+    return ROLE_ATTACK[role as Exclude<FleetRole, "none">];
+  }
+  return FIGHTER_ATTACK;
+}
+
+/**
+ * Auto-drone bay — ships with a high DRONES stat field scout drones when
+ * hostiles are nearby. Uses existing fleet_unit + scout role (not a parallel
+ * entity system). Capacity = floor(dronesStat / 25), cap 4 per host.
+ */
+export const AUTO_DRONE = {
+  /** Fleet role spawned as an auto drone. */
+  role: "scout" as Exclude<FleetRole, "none">,
+  /** Min drones stat required to field any auto bay. */
+  minStat: 40,
+  /** Divisor: capacity = floor(stat / this), hard-capped at maxPerHost. */
+  statDivisor: 25,
+  maxPerHost: 4,
+  /** Ms between auto-deploy attempts per host. */
+  cooldownMs: 7_500,
+  /** Host must see a hostile within this range (m) to launch. */
+  engageRange: 720,
+  /** Formation ring under the host (m). */
+  launchOffset: 28,
+} as const;
+
+/** Max auto drones a hull with this drones-stat can field. */
+export function autoDroneCapacity(dronesStat: number): number {
+  if (dronesStat < AUTO_DRONE.minStat) return 0;
+  return Math.min(
+    AUTO_DRONE.maxPerHost,
+    Math.max(1, Math.floor(dronesStat / AUTO_DRONE.statDivisor)),
+  );
+}
+
+/**
+ * Rock-node production order: every faction-build fleet role, lightest → heaviest.
+ * Server picks the first under-cap role so rocks field a full playable fleet.
+ */
+export const ROCK_PRODUCE_ORDER: Exclude<FleetRole, "none">[] = [
+  "miner",
+  "scout",
+  "corsair",
+  "frigate",
+  "cruiser",
+  "dreadnought",
+];
+
 // ─── Per-class stats system ──────────────────────────────────────────────────
 
 /**
@@ -749,9 +960,9 @@ export interface ShipStatCard {
   attack: number;
   /** Shield bank + recharge rate. */
   shield: number;
-  /** Splash / burst flavour (presentation only). */
+  /** Splash / burst flavour — scales flak/plasma splash radius. */
   explosive: number;
-  /** Drone-fielding capacity (presentation only). */
+  /** Drone-fielding capacity — drives auto-drone bay size (see AUTO_DRONE). */
   drones: number;
 }
 
@@ -888,9 +1099,25 @@ export function armorFor(e: Pick<EntityState, "kind" | "role" | "faction">): num
   return combatProfileFor(e.kind, e.role, e.faction).armor;
 }
 
-/** Outgoing weapon damage (per bolt) for this entity (ATTACK stat). */
+/** Outgoing weapon damage (per bolt) for this entity (attack style + ATTACK stat). */
 export function weaponDamageFor(e: Pick<EntityState, "kind" | "role" | "faction">): number {
-  return WEAPON.damage * combatProfileFor(e.kind, e.role, e.faction).damageMult;
+  const profile = attackProfileFor(e.kind, e.role);
+  const base = profile.damage > 0 ? profile.damage : WEAPON.damage;
+  return Math.round(base * combatProfileFor(e.kind, e.role, e.faction).damageMult * 10) / 10;
+}
+
+/** Splash radius (m) for this entity's primary bolt, scaled by EXPLOSIVE stat. */
+export function weaponSplashFor(e: Pick<EntityState, "kind" | "role" | "faction">): number {
+  const profile = attackProfileFor(e.kind, e.role);
+  if (profile.splashRadius <= 0) return 0;
+  const card =
+    e.kind === "fleet_unit" && e.faction
+      ? (statCardForFactionRole(e.faction, e.role) ?? statCardForRole(e.role))
+      : e.kind === "fleet_unit"
+        ? statCardForRole(e.role)
+        : null;
+  const expl = card?.explosive ?? (e.kind === "mother_ship" ? 70 : 30);
+  return Math.round(profile.splashRadius * (0.6 + expl / 200) * 10) / 10;
 }
 
 /** Shield regen (points/sec) for this entity (SHIELD stat). */
@@ -1139,6 +1366,8 @@ export interface ProjectileState {
   vz: number;
   /** Omitted or `"bolt"` for standard lasers; `"missile"` for guided rockets. */
   kind?: ProjectileKind;
+  /** Attack style for client VFX (laser/pulse/plasma/flak/rail). */
+  style?: ProjectileStyle;
 }
 
 export type GameEvent =

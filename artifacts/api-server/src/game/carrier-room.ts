@@ -25,8 +25,10 @@
 import { randomUUID } from "node:crypto";
 import {
   BOSS,
+  AUTO_DRONE,
   CARRIER,
   CELESTIAL,
+  DEPLOYABLE_ROLES,
   ENEMY,
   FLEET_ROLES,
   MOTHER_SHIP,
@@ -34,6 +36,7 @@ import {
   PLATFORM,
   PLATFORM_DEFS,
   REWARD,
+  ROCK_PRODUCE_ORDER,
   SHIP,
   SHIP_TYPES,
   TICK_DT,
@@ -44,12 +47,18 @@ import {
   SHIELD,
   WEAPON,
   MISSILE,
+  MOTHER_AEGIS,
   WORLD_SEED,
   applyCelestialForces,
+  attackProfileFor,
+  autoDroneCapacity,
+  combatProfileFor,
   damageEntity,
   fleetFireCooldownTicks,
+  friendlyAegisMother,
   shieldRegenPerSecFor,
   weaponDamageFor,
+  weaponSplashFor,
   encode,
   escortIntent,
   FACTION_ORDER,
@@ -57,6 +66,7 @@ import {
   fleetIntent,
   fleetRoleDef,
   fleetRoleDefFor,
+  factionFleetShip,
   platformDefFor,
   miningFor,
   FACTION_BUILD,
@@ -78,6 +88,8 @@ import {
   spawnShip,
   stepCelestial,
   stepShip,
+  statCardForFactionMothership,
+  statCardForFactionRole,
   type BeamState,
   type CelestialBody,
   type CelestialKind,
@@ -125,8 +137,10 @@ interface Player {
   navTarget: { tx: number; ty: number; tz: number; celestialId?: string } | null;
   /** Asteroid claimed when the mothership arrives ("take the rock"). */
   claimedRockId: string | null;
-  /** Ticks remaining to finish one level-1 craft at the rock node (0 = idle). */
+  /** Ticks remaining to finish the next faction fleet hull at the rock node (0 = idle). */
   produceTicks: number;
+  /** Role currently fabricating at the rock node (set when produce starts). */
+  produceRole: FleetRole | null;
   /** True when the player manually steered the mothership this tick (pauses nav). */
   motherManualInput: boolean;
 }
@@ -159,8 +173,12 @@ type LiveProjectile = ProjectileState & {
   dieAt: number;
   /** Player id of whoever fired — used to suppress friendly fire. */
   ownerPlayer: string;
-  /** Per-projectile damage override (missiles hit harder). */
+  /** Per-projectile damage override (missiles / role attack styles). */
   damage?: number;
+  /** Hit radius override from attack profile. */
+  hitRadius?: number;
+  /** Splash radius on impact (flak / plasma / rail). */
+  splashRadius?: number;
 };
 
 /** Per-fleet-unit server-only bookkeeping (never sent on the wire). */
@@ -241,12 +259,12 @@ function steerToward(
   };
 }
 
-/** Fleet weapon cooldown expressed in whole ticks. */
+/** Fleet weapon cooldown expressed in whole ticks (baseline; roles scale via fireCooldownMult). */
 const FLEET_FIRE_COOLDOWN_TICKS = Math.ceil((WEAPON.cooldownMs * 2) / (1000 / TICK_HZ));
-/** Ticks to fabricate one level-1 (miner) craft at a rock node. */
+/** Ticks to fabricate the next faction fleet hull at a rock node. */
 const MOTHER_PRODUCE_TICKS = Math.max(1, Math.round(CARRIER.motherProduceSec * TICK_HZ));
-/** Level-1 craft role produced by the mothership rock node. */
-const LEVEL1_ROLE: FleetRole = "miner";
+/** Auto-drone bay cooldown in ticks. */
+const AUTO_DRONE_COOLDOWN_TICKS = Math.max(1, Math.round((AUTO_DRONE.cooldownMs / 1000) * TICK_HZ));
 
 export class CarrierRoom {
   private players = new Map<string, Player>();
@@ -279,6 +297,12 @@ export class CarrierRoom {
   private controlledIds = new Set<string>();
   /** Last wall-clock ms each entity took shield damage (drives regen delay). */
   private shieldHitAt = new Map<string, number>();
+  /** Base maxShield at spawn — aegis multiplies capacity without losing the baseline. */
+  private baseMaxShield = new Map<string, number>();
+  /** Auto-drone bay: host entity id → last deploy simTick. */
+  private lastAutoDroneTick = new Map<string, number>();
+  /** Auto-drone entity id → host entity id (counts against host bay capacity). */
+  private autoDroneOf = new Map<string, string>();
   /** Escorting fleet units → the player id whose controlled ship they guard. */
   private escorts = new Map<string, string>();
   /** Spherical obstacles the fleet steers around (the celestial bodies). */
@@ -670,6 +694,7 @@ export class CarrierRoom {
       navTarget: null,
       claimedRockId: null,
       produceTicks: 0,
+      produceRole: null,
       motherManualInput: false,
     };
     this.players.set(id, player);
@@ -964,16 +989,32 @@ export class CarrierRoom {
     return true;
   }
 
-  /** Manually queue one level-1 craft at the rock node (if idle + at rock). */
+  /**
+   * Manually queue the next under-cap faction fleet hull at the rock node.
+   * Rocks field every deployable role (full playable faction set), not miner-only.
+   */
   produce(id: string): boolean {
     const p = this.players.get(id);
     if (!p || !p.joined || p.produceTicks > 0) return false;
     const mother = this.entities.get(p.motherShipId);
     if (!mother || !mother.alive) return false;
     if (!this.motherAtRockNode(p, mother)) return false;
-    if (!this.canDeployRole(p, LEVEL1_ROLE, true)) return false;
+    const role = this.nextRockProduceRole(p);
+    if (!role) return false;
+    p.produceRole = role;
     p.produceTicks = MOTHER_PRODUCE_TICKS;
     return true;
+  }
+
+  /**
+   * Next faction fleet role the rock node should fabricate: first under-cap
+   * role in ROCK_PRODUCE_ORDER so players get the full build set over time.
+   */
+  private nextRockProduceRole(p: Player): Exclude<FleetRole, "none"> | null {
+    for (const role of ROCK_PRODUCE_ORDER) {
+      if (this.canDeployRole(p, role, true)) return role;
+    }
+    return null;
   }
 
   private canDeployRole(p: Player, role: FleetRole, skipCost = false): boolean {
@@ -1047,6 +1088,7 @@ export class CarrierRoom {
   private tickMotherProduction(p: Player, mother: EntityState): void {
     if (!this.motherAtRockNode(p, mother)) {
       p.produceTicks = 0;
+      p.produceRole = null;
       return;
     }
     if (p.produceTicks > 0) {
@@ -1054,18 +1096,24 @@ export class CarrierRoom {
       if (p.produceTicks === 0) this.deployFromRockNode(p);
       return;
     }
-    if (this.canDeployRole(p, LEVEL1_ROLE, true)) {
+    const role = this.nextRockProduceRole(p);
+    if (role) {
+      p.produceRole = role;
       p.produceTicks = MOTHER_PRODUCE_TICKS;
     }
   }
 
-  /** Deploy one level-1 craft from the rock node — no credit cost. */
+  /** Deploy one faction fleet hull from the rock node — no credit cost. */
   private deployFromRockNode(p: Player): void {
     const mother = this.entities.get(p.motherShipId);
     if (!mother || !mother.alive) return;
-    if (!this.canDeployRole(p, LEVEL1_ROLE, true)) return;
+    const role = (p.produceRole && isDeployableRole(p.produceRole)
+      ? p.produceRole
+      : this.nextRockProduceRole(p)) as Exclude<FleetRole, "none"> | null;
+    p.produceRole = null;
+    if (!role || !this.canDeployRole(p, role, true)) return;
 
-    const def = fleetRoleDefFor(p.faction, LEVEL1_ROLE);
+    const def = fleetRoleDefFor(p.faction, role);
     if (!def) return;
 
     const jx = (this.rng() * 2 - 1) * 24;
@@ -1076,7 +1124,7 @@ export class CarrierRoom {
 
     const uuid = randomUUID();
     const unit = spawnEntity(uuid, `${def.label}-${uuid.slice(0, 4)}`,
-      "fleet_unit", p.id, mother.team, roleShipType(LEVEL1_ROLE), px, py, pz, mother.yaw, LEVEL1_ROLE,
+      "fleet_unit", p.id, mother.team, roleShipType(role), px, py, pz, mother.yaw, role,
       p.faction);
     unit.zoneR = def.zoneR;
 
@@ -1091,7 +1139,7 @@ export class CarrierRoom {
     });
 
     this.refreshZone(unit);
-    logger.info({ id: p.id, role: LEVEL1_ROLE, uuid }, "rock-node craft deployed");
+    logger.info({ id: p.id, role, uuid }, "rock-node craft deployed");
   }
 
   /** Re-anchor a tethered platform to its mothership at its slot offset. */
@@ -1288,6 +1336,9 @@ export class CarrierRoom {
     // Built-in mothership defensive turrets.
     this.tickMotherTurrets(now);
 
+    // Auto-drone bays on high-drones-stat ships (mothership + fleet hulls).
+    this.tickAutoDrones(now);
+
     // Player input.
     for (const p of this.players.values()) {
       const entity = this.entities.get(p.controlledEntityId);
@@ -1375,17 +1426,56 @@ export class CarrierRoom {
   }
 
   /**
-   * Recharge entity shields. A shield only regenerates once `SHIELD.regenDelayMs`
-   * has elapsed since it last took damage; it then refills at `SHIELD.regenPerSec`
-   * up to the entity's `maxShield`. Dead entities and those with no shield capacity
-   * are skipped. Uses wall-clock `now` to gate the delay (server authority).
+   * Recharge entity shields.
+   *
+   * Baseline: after `SHIELD.regenDelayMs` quiet, refill at `shieldRegenPerSecFor`.
+   * Friendly mothership aegis (5× hull-length radius): while inside, maxShield
+   * becomes base×3; after `MOTHER_AEGIS.outOfCombatMs` without damage, shield
+   * fully recharges over `MOTHER_AEGIS.regenOverMs` (fast 5s fill).
    */
   private regenShields(now: number): void {
+    const mothers: EntityState[] = [];
     for (const e of this.entities.values()) {
-      if (!e.alive || e.maxShield <= 0 || e.shield >= e.maxShield) continue;
+      if (e.alive && e.kind === "mother_ship") mothers.push(e);
+      // Capture baseline maxShield the first time we see this id
+      if (e.maxShield > 0 && !this.baseMaxShield.has(e.id)) {
+        this.baseMaxShield.set(e.id, e.maxShield);
+      }
+    }
+
+    for (const e of this.entities.values()) {
+      if (!e.alive) continue;
+      const base = this.baseMaxShield.get(e.id) ?? e.maxShield;
+      if (base <= 0) continue;
+
+      const cover = friendlyAegisMother(e, mothers);
+      const effMax = cover ? base * MOTHER_AEGIS.shieldMul : base;
+      // Snapshot maxShield so clients show the boosted bank while under aegis
+      e.maxShield = effMax;
+      if (e.shield > effMax) e.shield = effMax;
+
+      if (e.shield >= effMax) continue;
+
       const hitAt = this.shieldHitAt.get(e.id) ?? 0;
-      if (now - hitAt < SHIELD.regenDelayMs) continue;
-      e.shield = Math.min(e.maxShield, e.shield + shieldRegenPerSecFor(e) * TICK_DT);
+      const quiet = now - hitAt;
+      const outOfCombat = quiet >= MOTHER_AEGIS.outOfCombatMs;
+
+      let regenPerSec = shieldRegenPerSecFor(e);
+      let delayMs = SHIELD.regenDelayMs;
+
+      if (cover) {
+        if (outOfCombat) {
+          // Full refill over 5s under friendly forcefield after 10s no combat
+          delayMs = 0;
+          regenPerSec = effMax / (MOTHER_AEGIS.regenOverMs / 1000);
+        } else {
+          // Still in combat: modest boost after standard delay
+          regenPerSec = shieldRegenPerSecFor(e) * 1.75;
+        }
+      }
+
+      if (quiet < delayMs) continue;
+      e.shield = Math.min(effMax, e.shield + regenPerSec * TICK_DT);
     }
   }
 
@@ -1658,9 +1748,14 @@ export class CarrierRoom {
       stepShip(unit, intent, TICK_DT);
 
       const def = fleetRoleDefFor(unit.faction, unit.role);
-      if (intent.fire && def && def.armed &&
-          this.simTick - meta.lastFireTick >=
-            fleetFireCooldownTicks(unit.role, FLEET_FIRE_COOLDOWN_TICKS, unit.faction)) {
+      const atk = attackProfileFor(unit.kind, unit.role);
+      const roleCdTicks = Math.max(
+        3,
+        Math.round((atk.cooldownMs / 1000) * TICK_HZ *
+          combatProfileFor(unit.kind, unit.role, unit.faction).fireCooldownMult),
+      );
+      if (intent.fire && def && def.armed && atk.damage > 0 &&
+          this.simTick - meta.lastFireTick >= roleCdTicks) {
         meta.lastFireTick = this.simTick;
         this.spawnProjectile(unit, unit.owner, now);
       }
@@ -1861,17 +1956,23 @@ export class CarrierRoom {
         const mz = e.pz + Math.sin(ang) * r;
         const dx = target.px - mx, dy = target.py - my, dz = target.pz - mz;
         const d = Math.hypot(dx, dy, dz) || 1;
+        const matk = attackProfileFor(e.kind, e.role);
         this.projectiles.push({
           id: nextProjectileId++,
           // Attribute to the mothership so friendly-fire checks treat the salvo
           // as the commander's own fire (never hits its fleet/fighter/itself).
           owner: e.id,
           ownerPlayer: e.owner,
+          kind: "bolt",
+          style: matk.style,
           px: mx, py: my, pz: mz,
-          vx: (dx / d) * WEAPON.projectileSpeed,
-          vy: (dy / d) * WEAPON.projectileSpeed,
-          vz: (dz / d) * WEAPON.projectileSpeed,
-          dieAt: now + WEAPON.projectileLifeMs,
+          vx: (dx / d) * matk.projectileSpeed,
+          vy: (dy / d) * matk.projectileSpeed,
+          vz: (dz / d) * matk.projectileSpeed,
+          dieAt: now + matk.projectileLifeMs,
+          damage: weaponDamageFor(e),
+          hitRadius: matk.hitRadius,
+          splashRadius: weaponSplashFor(e),
         });
         this.events.push({ k: "fire", px: mx, py: my, pz: mz });
       }
@@ -1924,7 +2025,11 @@ export class CarrierRoom {
     setLast: (t: number) => void,
   ): void {
     if (!entity.alive) return;
-    if (now - getLast() < WEAPON.cooldownMs) return;
+    const atk = attackProfileFor(entity.kind, entity.role);
+    if (atk.damage <= 0) return;
+    const cd = Math.max(40, atk.cooldownMs *
+      combatProfileFor(entity.kind, entity.role, entity.faction).fireCooldownMult);
+    if (now - getLast() < cd) return;
     setLast(now);
     this.spawnProjectile(entity, ownerPlayer, now);
   }
@@ -1970,6 +2075,13 @@ export class CarrierRoom {
     fy: number,
     fz: number,
   ): void {
+    const atk = attackProfileFor(entity.kind, entity.role);
+    // Unarmed miners do not fire combat bolts (mining beams only).
+    if (atk.damage <= 0 || atk.projectileSpeed <= 0) return;
+    const speed = atk.projectileSpeed;
+    const life = atk.projectileLifeMs;
+    const dmg = weaponDamageFor(entity);
+    const splash = weaponSplashFor(entity);
     const mx = entity.px + fx * WEAPON.muzzleForward;
     const my = entity.py + fy * WEAPON.muzzleForward;
     const mz = entity.pz + fz * WEAPON.muzzleForward;
@@ -1978,11 +2090,15 @@ export class CarrierRoom {
       owner: entity.id,
       ownerPlayer,
       kind: "bolt",
+      style: atk.style,
       px: mx, py: my, pz: mz,
-      vx: fx * WEAPON.projectileSpeed + entity.vx,
-      vy: fy * WEAPON.projectileSpeed + entity.vy,
-      vz: fz * WEAPON.projectileSpeed + entity.vz,
-      dieAt: now + WEAPON.projectileLifeMs,
+      vx: fx * speed + entity.vx,
+      vy: fy * speed + entity.vy,
+      vz: fz * speed + entity.vz,
+      dieAt: now + life,
+      damage: dmg,
+      hitRadius: atk.hitRadius,
+      splashRadius: splash,
     });
     this.events.push({ k: "fire", px: mx, py: my, pz: mz });
     this.lastFireTick.set(entity.id, this.tickCount);
@@ -1991,6 +2107,91 @@ export class CarrierRoom {
       y: my + fy * LASER_LEN,
       z: mz + fz * LASER_LEN,
     });
+  }
+
+  /**
+   * Auto-drone bay: motherships and high-drones fleet hulls launch scout
+   * drones when hostiles are in range, up to capacity from the DRONES stat.
+   * Drones auto-escort the commander and count toward the fleet cap.
+   */
+  private tickAutoDrones(_now: number): void {
+    // Prune dead auto-drone links.
+    for (const [droneId, hostId] of [...this.autoDroneOf]) {
+      const drone = this.entities.get(droneId);
+      const host = this.entities.get(hostId);
+      if (!drone?.alive || !host?.alive) this.autoDroneOf.delete(droneId);
+    }
+
+    for (const host of this.entities.values()) {
+      if (!host.alive) continue;
+      if (host.kind !== "mother_ship" && host.kind !== "fleet_unit") continue;
+      // Only player-owned hulls field auto bays (not AI pirates).
+      if (!host.owner || host.owner.startsWith("ai-")) continue;
+      const p = this.players.get(host.owner);
+      if (!p?.joined) continue;
+
+      const card = host.kind === "mother_ship"
+        ? statCardForFactionMothership(host.faction, host.shipType)
+        : statCardForFactionRole(host.faction, host.role);
+      if (!card) continue;
+      const cap = autoDroneCapacity(card.drones);
+      if (cap <= 0) continue;
+
+      let fielded = 0;
+      for (const h of this.autoDroneOf.values()) if (h === host.id) fielded++;
+      if (fielded >= cap) continue;
+
+      const last = this.lastAutoDroneTick.get(host.id) ?? 0;
+      if (this.simTick - last < AUTO_DRONE_COOLDOWN_TICKS) continue;
+
+      // Need a hostile in engage range.
+      let nearHostile = false;
+      const r2 = AUTO_DRONE.engageRange * AUTO_DRONE.engageRange;
+      for (const t of this.entities.values()) {
+        if (!t.alive || t.team === host.team || t.owner === host.owner) continue;
+        const dx = t.px - host.px, dy = t.py - host.py, dz = t.pz - host.pz;
+        if (dx * dx + dy * dy + dz * dz <= r2) { nearHostile = true; break; }
+      }
+      if (!nearHostile) continue;
+
+      const role = AUTO_DRONE.role;
+      if (!this.canDeployRole(p, role, true)) continue;
+
+      const def = fleetRoleDefFor(p.faction, role);
+      if (!def) continue;
+
+      const ang = this.rng() * Math.PI * 2;
+      const jx = Math.cos(ang) * AUTO_DRONE.launchOffset;
+      const jz = Math.sin(ang) * AUTO_DRONE.launchOffset;
+      const uuid = randomUUID();
+      const unit = spawnEntity(
+        uuid,
+        `${def.label}-auto-${uuid.slice(0, 4)}`,
+        "fleet_unit",
+        p.id,
+        host.team,
+        roleShipType(role),
+        host.px + jx,
+        host.py - CARRIER.launchOffset * 0.5,
+        host.pz + jz,
+        host.yaw,
+        role,
+        p.faction,
+      );
+      unit.zoneR = def.zoneR * 0.55;
+      this.fleet.set(uuid, {
+        offX: jx,
+        offY: -def.zoneR * 0.1,
+        offZ: jz,
+        lastFireTick: 0,
+      });
+      this.refreshZone(unit);
+      this.autoDroneOf.set(uuid, host.id);
+      // Auto-join the commander as escort so drones follow the player.
+      this.escorts.set(uuid, p.id);
+      this.lastAutoDroneTick.set(host.id, this.simTick);
+      logger.info({ owner: p.id, host: host.id, uuid, role }, "auto drone deployed");
+    }
   }
 
   /** Launch a homing missile along the ship's nose. */
@@ -2187,17 +2388,19 @@ export class CarrierRoom {
         if (shooter && shooter.team === target.team) continue;
         if (target.owner === pr.ownerPlayer) continue;
         const dx = target.px - pr.px, dy = target.py - pr.py, dz = target.pz - pr.pz;
-        const hitR = pr.kind === "missile" ? MISSILE.hitRadius : WEAPON.hitRadius;
+        const hitR = pr.kind === "missile"
+          ? MISSILE.hitRadius
+          : (pr.hitRadius ?? WEAPON.hitRadius);
         if (dx * dx + dy * dy + dz * dz <= hitR * hitR) {
           if (pr.kind === "missile") {
             this.detonateMissile(pr, now, deadFleet);
+          } else if (pr.splashRadius && pr.splashRadius > 0) {
+            this.detonateBoltSplash(pr, now, deadFleet);
           } else {
             this.applyDamage(target, pr.owner, now, pr.damage);
+            if (!target.alive && target.kind === "fleet_unit") deadFleet.add(target.id);
           }
           this.events.push({ k: "hit", px: pr.px, py: pr.py, pz: pr.pz });
-          if (pr.kind !== "missile" && !target.alive && target.kind === "fleet_unit") {
-            deadFleet.add(target.id);
-          }
           hit = true;
           break;
         }
@@ -2207,9 +2410,10 @@ export class CarrierRoom {
         for (const plat of this.platforms.values()) {
           if (plat.owner === pr.ownerPlayer) continue;
           const dx = plat.px - pr.px, dy = plat.py - pr.py, dz = plat.pz - pr.pz;
-          if (dx * dx + dy * dy + dz * dz <= WEAPON.hitRadius * WEAPON.hitRadius) {
+          const hitR = pr.hitRadius ?? WEAPON.hitRadius;
+          if (dx * dx + dy * dy + dz * dz <= hitR * hitR) {
             const shooter = this.entities.get(pr.owner);
-            plat.hp -= shooter ? weaponDamageFor(shooter) : WEAPON.damage;
+            plat.hp -= pr.damage ?? (shooter ? weaponDamageFor(shooter) : WEAPON.damage);
             this.events.push({ k: "hit", px: pr.px, py: pr.py, pz: pr.pz });
             hit = true;
             break;
@@ -2244,6 +2448,31 @@ export class CarrierRoom {
       const dx = target.px - pr.px, dy = target.py - pr.py, dz = target.pz - pr.pz;
       if (dx * dx + dy * dy + dz * dz > r2) continue;
       this.applyDamage(target, pr.owner, now, dmg);
+      if (!target.alive && target.kind === "fleet_unit") deadFleet.add(target.id);
+    }
+    this.events.push({ k: "explode", px: pr.px, py: pr.py, pz: pr.pz });
+  }
+
+  /** Flak / plasma / rail bolt splash — softer than missiles, style-driven radius. */
+  private detonateBoltSplash(
+    pr: LiveProjectile,
+    now: number,
+    deadFleet: Set<string>,
+  ): void {
+    const dmg = pr.damage ?? WEAPON.damage;
+    const splash = pr.splashRadius ?? 0;
+    const r2 = splash * splash;
+    const shooter = this.entities.get(pr.owner);
+    for (const target of this.entities.values()) {
+      if (!target.alive || target.id === pr.owner) continue;
+      if (shooter && shooter.team === target.team) continue;
+      if (target.owner === pr.ownerPlayer) continue;
+      const dx = target.px - pr.px, dy = target.py - pr.py, dz = target.pz - pr.pz;
+      if (dx * dx + dy * dy + dz * dz > r2) continue;
+      // Falloff: full damage at center, half at edge.
+      const d = Math.hypot(dx, dy, dz);
+      const fall = splash > 0 ? 1 - 0.5 * (d / splash) : 1;
+      this.applyDamage(target, pr.owner, now, dmg * fall);
       if (!target.alive && target.kind === "fleet_unit") deadFleet.add(target.id);
     }
     this.events.push({ k: "explode", px: pr.px, py: pr.py, pz: pr.pz });
@@ -2297,6 +2526,8 @@ export class CarrierRoom {
     this.fleet.delete(id);
     this.escorts.delete(id);
     this.shieldHitAt.delete(id);
+    this.autoDroneOf.delete(id);
+    this.lastAutoDroneTick.delete(id);
   }
 
   // ─── Broadcast ───────────────────────────────────────────────────────────────

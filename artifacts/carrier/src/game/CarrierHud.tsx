@@ -379,7 +379,7 @@ export function CarrierHud({
         </div>
       )}
 
-      {/* Fleet Log — fly any owned hull; drones escort on right-click */}
+      {/* Fleet Log — LMB select/fly any owned hull; RMB follow/join */}
       {online && state.roster.length > 0 && (
         <div className="pointer-events-auto absolute left-5 top-14 w-60 rounded-md border border-white/15 bg-black/50 p-3 text-xs backdrop-blur-sm">
           <div className="mb-1 flex items-center justify-between uppercase tracking-widest text-white/50">
@@ -387,7 +387,7 @@ export function CarrierHud({
             <span className="text-white/30">Tab ⇄</span>
           </div>
           <div className="mb-2 text-[9px] leading-tight text-white/35">
-            LMB: fly this ship · RMB: drone escort · Tab: carrier ↔ last ship
+            LMB: select &amp; fly · RMB: follow / join you · Tab: carrier ↔ last ship
           </div>
           <div className="flex flex-col gap-1.5">
             {state.roster.map((u) => {
@@ -401,9 +401,11 @@ export function CarrierHud({
               return (
                 <button
                   key={u.id}
+                  type="button"
                   onClick={() => onBecome(u.id)}
                   onContextMenu={(e) => {
                     e.preventDefault();
+                    e.stopPropagation();
                     if (u.summonable) onSummon(u.id);
                   }}
                   className={`flex items-start gap-2 rounded border px-2 py-1.5 text-left transition-colors ${
@@ -417,10 +419,10 @@ export function CarrierHud({
                     active
                       ? "You are flying this ship"
                       : u.summonable
-                        ? `Fly ${u.label} (LMB) · ${u.escorting ? "Recall escort" : "Order to escort"} (RMB)`
+                        ? `Select ${u.label} (LMB) · ${u.escorting ? "Dismiss from formation" : "Follow / join you"} (RMB)`
                         : u.isMother
-                          ? `Fly the carrier (LMB) · Tab also toggles here`
-                          : `Fly ${u.label} (LMB)`
+                          ? `Select carrier (LMB) · Tab also toggles here`
+                          : `Select ${u.label} (LMB)`
                   }
                 >
                   <span className="mt-0.5" style={{ color: accent }}>{ROSTER_ICON[u.kind] ?? "●"}</span>
@@ -731,6 +733,51 @@ export function CarrierHud({
         </div>
       )}
 
+      {/* Friendly mothership forcefield (aegis) — 5× hull radius, 3× shields */}
+      {online && state.aegis?.active && (
+        <div className="pointer-events-none absolute left-1/2 top-[4.5rem] w-[min(92vw,22rem)] -translate-x-1/2 rounded-md border border-[#44ccff]/40 bg-[#0a2030]/75 px-3 py-2 text-xs backdrop-blur-sm">
+          <div className="flex items-center justify-between gap-2">
+            <span className="uppercase tracking-[0.2em] text-[#66ddff]">
+              Carrier forcefield
+            </span>
+            <span className="tabular-nums text-[#88eeff]/80">
+              {Math.round(state.aegis.radius)} m
+            </span>
+          </div>
+          <div className="mt-1 text-[10px] text-white/65">
+            3× shield bank · fast regen after 10s out of combat (5s full fill)
+          </div>
+          <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/15">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-[#2288ff] to-[#66eeff]"
+              style={{
+                width: `${Math.max(0, Math.min(100, (state.shield / Math.max(1, state.aegis.effMaxShield || state.maxShield)) * 100))}%`,
+              }}
+            />
+          </div>
+          <div className="mt-0.5 flex justify-between text-[9px] text-white/45">
+            <span>Shield</span>
+            <span className="tabular-nums">
+              {Math.round(state.shield)} / {Math.round(state.aegis.effMaxShield || state.maxShield)}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Hostile capital assault strip — enemy carrier blips on strategic map */}
+      {online && state.mapBlips?.some((b) => b.kind === "carrier" && b.mission && b.label !== "Your capital") && (
+        <div className="pointer-events-none absolute right-5 top-28 w-52 rounded-md border border-[#ff5533]/35 bg-black/55 px-2.5 py-2 text-[10px] backdrop-blur-sm">
+          <div className="uppercase tracking-widest text-[#ff7755]">Capital assault</div>
+          <div className="mt-1 text-white/70">
+            Hostile capital in sector. Forcefield is 5× hull radius — chip from outside the bubble or
+            push under fire with fire-laser (LMB/F) + missiles (RMB).
+          </div>
+          <div className="mt-1.5 text-white/45">
+            Open map · M · target capital blips · stay mobile
+          </div>
+        </div>
+      )}
+
       {/* Mothership mission strip */}
       {online && (state.motherMission.navActive || state.motherMission.atRockNode) && (
         <div className="pointer-events-auto absolute left-1/2 top-14 w-[min(92vw,28rem)] -translate-x-1/2 rounded-md border border-[#00d4ff]/35 bg-black/60 px-3 py-2 text-xs backdrop-blur-sm">
@@ -743,7 +790,7 @@ export function CarrierHud({
                 onClick={onProduce}
                 className="rounded border border-[#ffd23f]/50 px-2 py-0.5 text-[10px] uppercase tracking-wider text-[#ffd23f] hover:bg-[#ffd23f]/10"
               >
-                Build miner
+                Build fleet hull
               </button>
             )}
           </div>
@@ -753,7 +800,7 @@ export function CarrierHud({
           {state.motherMission.atRockNode && state.motherMission.produceProgress > 0 && (
             <div className="mt-1.5">
               <div className="mb-0.5 flex justify-between text-[10px] text-white/50">
-                <span>Fabricating L1 craft</span>
+                <span>Fabricating faction ship</span>
                 <span>{Math.round(state.motherMission.produceProgress * 100)}%</span>
               </div>
               <div className="h-1 overflow-hidden rounded-full bg-white/15">

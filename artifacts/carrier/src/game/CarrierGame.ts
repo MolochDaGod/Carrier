@@ -42,8 +42,11 @@ import {
   PLATFORM_DEFS,
   PLATFORM_KINDS,
   SHIP,
+  factionFleetShip,
   fleetRoleDef,
   fleetRoleDefFor,
+  friendlyAegisMother,
+  motherAegisRadius,
   platformDefFor,
   forwardVec,
   motherTurretVisualCount,
@@ -127,7 +130,7 @@ const TUTORIAL_STEPS: { title: string; body: string; maxMs: number }[] = [
   { title: "Maneuver", body: "A / D to turn · ↑ / ↓ to pitch · move the mouse to aim. Click once to lock the cursor.", maxMs: 11000 },
   { title: "Afterburner", body: "Hold Shift to boost — watch the afterburner gauge heat up.", maxMs: 8000 },
   { title: "Weapons", body: "LMB or Space to fire cannons · RMB to launch homing missiles.", maxMs: 9000 },
-  { title: "Command", body: "Fleet Log (left): click any ship to fly it · right-click drones to escort · Tab toggles carrier ↔ your last ship.", maxMs: 9000 },
+  { title: "Command", body: "Fleet Log (left): LMB select & fly any faction ship · RMB order ships to follow/join you · Tab toggles carrier ↔ last ship. Rocks auto-build your full fleet.", maxMs: 9000 },
   { title: "Engage", body: "You're cleared for combat, Commander. Hostiles inbound — good hunting.", maxMs: 5500 },
 ];
 
@@ -228,9 +231,10 @@ export class CarrierGame {
   private projSplines = new Map<number, THREE.Line>();
   // Spinning shuriken bolt: a flat throwing-star disc (normal +Z) that whirls
   // down its line of travel, trailing a quarks flame/particle exhaust.
-  private projGeo = makeShurikenGeometry(2.6);
+  // Fire-laser pulse bolt (casting fire look) — thin bright disc, high ROF
+  private projGeo = makeShurikenGeometry(1.8);
   private projMat = new THREE.MeshBasicMaterial({
-    color: 0xfff1c2, transparent: true, opacity: 0.98,
+    color: 0xff8833, transparent: true, opacity: 0.95,
     depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
   });
   private missileGeo = new THREE.ConeGeometry(1.4, 5.2, 6);
@@ -480,7 +484,12 @@ export class CarrierGame {
     // Shared combat VFX layer (quarks). Prototypes load async; track()/play()
     // are no-ops until ready, so spawning before load simply skips the effect.
     this.vfx = new VfxManager(this.scene);
-    this.vfx.load(["fireSparks", "explosion", "muzzleFlash", "projectileTrail"]).catch(() => {});
+    // Fire-family from casting-style VFX: lasers use fireCast/fireSparks; destroys
+    // multi-layer fireArea + explosion; mines share the same fire burst.
+    this.vfx.load([
+      "fireSparks", "explosion", "muzzleFlash", "projectileTrail",
+      "fireCast", "fireball", "fireArea",
+    ]).catch(() => {});
     this.ensureMissileTemplates();
   }
 
@@ -696,7 +705,33 @@ export class CarrierGame {
       g.add(bubble);
       g.userData.shieldBubble = bubble;
     }
+    // Friendly/hostile mothership forcefield zone (5× hull length radius)
+    if (entity.kind === "mother_ship") {
+      const zoneR = motherAegisRadius();
+      const aegis = this.makeAegisZone(zoneR, entity.owner === this.selfId);
+      g.add(aegis);
+      g.userData.aegisZone = aegis;
+      g.userData.aegisBaseR = zoneR;
+    }
     return g;
+  }
+
+  /** Translucent forcefield sphere — world-scale radius in metres. */
+  private makeAegisZone(radius: number, friendly: boolean): THREE.Mesh {
+    const geo = new THREE.SphereGeometry(1, 32, 24);
+    const mat = new THREE.MeshBasicMaterial({
+      color: friendly ? 0x44ccff : 0xff5533,
+      transparent: true,
+      opacity: friendly ? 0.07 : 0.05,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.scale.setScalar(radius);
+    mesh.name = "mothership-aegis";
+    mesh.renderOrder = -2;
+    return mesh;
   }
 
   /** Rough visual hull radius per kind, for sizing tags + shield bubbles. */
@@ -1403,9 +1438,16 @@ export class CarrierGame {
       if (ev.k === "explode") this.spawnExplosion(ev.px, ev.py, ev.pz, true);
       else if (ev.k === "hit") {
         this.spawnImpact(ev.px, ev.py, ev.pz);
-        this.vfx?.play("explosion", new THREE.Vector3(ev.px, ev.py, ev.pz), { scale: 0.55, ttl: 420 });
+        // Multi-use fire explosion assets (casting fire family)
+        const p = new THREE.Vector3(ev.px, ev.py, ev.pz);
+        this.vfx?.play("explosion", p, { scale: 0.55, ttl: 420 });
+        this.vfx?.play("fireSparks", p, { scale: 0.7, ttl: 280 });
       } else if (ev.k === "fire") {
-        this.vfx?.play("muzzleFlash", new THREE.Vector3(ev.px, ev.py, ev.pz), { scale: 0.9, ttl: 120 });
+        // Quicker laser pulse: muzzle + fireCast flash (casting fire skill look)
+        const p = new THREE.Vector3(ev.px, ev.py, ev.pz);
+        this.vfx?.play("muzzleFlash", p, { scale: 0.75, ttl: 90, color: "#ffaa44" });
+        this.vfx?.play("fireCast", p, { scale: 0.55, ttl: 140, color: "#ff6622" });
+        this.vfx?.play("fireSparks", p, { scale: 0.5, ttl: 160 });
       } else if (ev.k === "impact") this.spawnImpact(ev.px, ev.py, ev.pz);
       else if (ev.k === "reward") this.spawnPickup(ev.px, ev.py, ev.pz);
       else if (ev.k === "universe") {
@@ -1844,6 +1886,17 @@ export class CarrierGame {
       const sc = 1 + frac * 0.08;
       bubble.scale.setScalar(sc);
     }
+    const aegis = g.userData.aegisZone as THREE.Mesh | undefined;
+    if (aegis) {
+      const friendly = s.owner === this.selfId || (this.self && s.team === this.self.team);
+      const mat = aegis.material as THREE.MeshBasicMaterial;
+      const pulse = 0.9 + 0.1 * Math.sin(performance.now() * 0.0015 + s.uid);
+      mat.color.setHex(friendly ? 0x44ccff : 0xff5533);
+      mat.opacity = s.alive ? (friendly ? 0.08 : 0.05) * pulse : 0;
+      aegis.visible = s.alive;
+      const baseR = (g.userData.aegisBaseR as number) || motherAegisRadius();
+      aegis.scale.setScalar(baseR);
+    }
   }
 
   /** Lazy-load homing-missile GLBs once; projectiles keep the cone fallback until ready. */
@@ -1918,10 +1971,14 @@ export class CarrierGame {
         mesh = this.createProjectileMesh(id, isMissile, ownerEnt);
         this.scene.add(mesh);
         this.projMeshes.set(id, mesh);
+        const styleColor = projectileStyleColor(p.style, isMissile);
         const trail = this.vfx?.track(
-          isMissile ? "projectileTrail" : "fireSparks",
+          isMissile ? "projectileTrail" : styleTrailEffect(p.style),
           mesh.position,
-          { scale: isMissile ? 2.2 : 1.6, color: isMissile ? "#ff6622" : undefined },
+          {
+            scale: isMissile ? 2.2 : styleTrailScale(p.style),
+            color: styleColor,
+          },
         );
         if (trail) this.projTrails.set(id, trail);
         if (isMissile) this.projHistory.set(id, []);
@@ -2248,7 +2305,12 @@ export class CarrierGame {
 
   private spawnExplosion(x: number, y: number, z: number, big = false): void {
     const pos = new THREE.Vector3(x, y, z);
+    // Layer multiple fire-family assets (destroy + mine-style bursts)
     this.vfx?.play("explosion", pos, { scale: big ? 1.4 : 0.85, ttl: big ? 900 : 600 });
+    this.vfx?.play("fireArea", pos, { scale: big ? 1.6 : 0.95, ttl: big ? 750 : 480, color: "#ff7722" });
+    this.vfx?.play("fireball", pos, { scale: big ? 1.2 : 0.7, ttl: big ? 500 : 320, color: "#ffaa33" });
+    this.vfx?.play("fireSparks", pos, { scale: big ? 1.8 : 1.1, ttl: big ? 700 : 400 });
+    try { this.vfx?.shockwave(pos, { scale: big ? 2.2 : 1.2, color: "#ff8844" }); } catch { /* optional */ }
     const mat = new THREE.MeshBasicMaterial({ color: 0xff6622, transparent: true, opacity: 0.9 });
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(SCALE.ship.miner * (big ? 1.6 : 1), 10, 10),
@@ -2712,10 +2774,11 @@ export class CarrierGame {
       const ef = entity.faction ?? myFaction;
       const hullModel = fleetModelFor(ef, entity.role as DeployRole);
       const hullDbg = fleetDebug.get(entity.id);
+      const authored = factionFleetShip(ef, entity.role);
       fleet.push({
         id: entity.id,
         role: entity.role,
-        label: fleetRoleDefFor(ef, entity.role)?.label ?? entity.role,
+        label: authored?.codename ?? fleetRoleDefFor(ef, entity.role)?.label ?? entity.role,
         hpPct: Math.max(0, Math.min(1, entity.hp / entity.maxHp)),
         shieldPct: entity.maxShield > 0
           ? Math.max(0, Math.min(1, entity.shield / entity.maxShield)) : 0,
@@ -2726,23 +2789,38 @@ export class CarrierGame {
     }
     const totalFleet = fleet.length;
 
+    // All faction-build roles are deployable (full playable set).
     const deployOptions: DeployOption[] = DEPLOYABLE_ROLES.map((role) => {
       const def = fleetRoleDefFor(myFaction, role)!;
+      const authored = factionFleetShip(myFaction, role);
       const ofRole = roleCounts[role] ?? 0;
       const available =
         credits >= def.cost &&
         totalFleet < CARRIER.maxFleetPerPlayer &&
         ofRole < def.cap;
-      return { role, label: def.label, cost: def.cost, available };
+      return {
+        role,
+        label: authored?.codename ?? def.label,
+        cost: def.cost,
+        available,
+      };
     });
 
-    // Roster of every owned, living unit — drives the become buttons.
+    // Roster of every owned living unit — LMB become / RMB summon-follow.
+    // Includes all rock-built + credit-deployed + auto-drone faction hulls.
     const roster: RosterRow[] = [];
     for (const entity of this.latestEntities.values()) {
       if (entity.owner !== this.selfId || !entity.alive) continue;
+      const ef = entity.faction ?? myFaction;
+      const fleetLabel = entity.kind === "fleet_unit"
+        ? (factionFleetShip(ef, entity.role)?.codename
+          ?? fleetRoleDefFor(ef, entity.role)?.label
+          ?? entity.role)
+        : null;
       const label = entity.kind === "mother_ship" ? "Carrier"
         : entity.kind === "fighter" ? "Fighter"
-        : fleetRoleDefFor(myFaction, entity.role)?.label ?? entity.role;
+        : fleetLabel ?? entity.role;
+      // Any non-piloted fleet hull can follow/join (including miners & auto drones).
       const summonable = entity.kind === "fleet_unit"
         && entity.role !== "none" && entity.id !== ceid;
       roster.push({
@@ -2775,13 +2853,23 @@ export class CarrierGame {
     const fdSnap = fleetDebug.snapshot();
     const lq = getLoadQueueStats();
     const ws = getWarmupState();
+    // Friendly mothership aegis cover for controlled unit
+    const mothers: EntityState[] = [];
+    for (const e of this.latestEntities.values()) {
+      if (e.alive && e.kind === "mother_ship") mothers.push(e);
+    }
+    const coverUnit = auth ?? this.self;
+    const coverMother = friendlyAegisMother(coverUnit as EntityState, mothers);
+    const aegisActive = !!coverMother;
+    const baseShield = SHIP.maxShield; // fighter baseline; server may boost maxShield in snap
+    const effMax = auth?.maxShield ?? baseShield;
     this.onHud({
       status: this.status,
       faction: { id: factionDef.id, name: factionDef.name, color: factionDef.color },
       players: this.latestEconomy.length,
       hp, maxHp: SHIP.maxHp,
       shield: auth?.shield ?? 0,
-      maxShield: auth?.maxShield ?? 0,
+      maxShield: effMax,
       alive, respawnIn,
       kills: auth?.kills ?? 0, deaths: auth?.deaths ?? 0,
       speed: Math.min(1, sp / SHIP.boostMaxSpeed),
@@ -2805,6 +2893,13 @@ export class CarrierGame {
       controllingMother: this.controllingMother(),
       cinematic: this.cinematicActive,
       hint: this.tutorialHint(),
+      aegis: {
+        active: aegisActive,
+        motherId: coverMother?.id ?? null,
+        radius: motherAegisRadius(),
+        effMaxShield: effMax,
+        quietSec: 0, // server-authoritative regen; client shows zone presence
+      },
       fleetDebug: {
         enabled: fdSnap.enabled,
         pending: fdSnap.summary.pending,
@@ -2863,7 +2958,21 @@ export class CarrierGame {
         if (e.id === ceid) { kind = "self"; color = "#ffffff"; }
         else if (e.kind === "mother_ship") { kind = "carrier"; color = "#00d4ff"; }
         else if (e.kind === "fleet_unit" && e.role !== "none") color = ROLE_COLORS[e.role];
-        blips.push({ x: norm(e.px), y: norm(e.pz), kind, color });
+        blips.push({
+          x: norm(e.px), y: norm(e.pz), kind, color,
+          id: e.id,
+          label: e.kind === "mother_ship" ? "Your capital" : undefined,
+          mission: e.kind === "mother_ship",
+        });
+      } else if (e.kind === "mother_ship") {
+        // Hostile / rival capital — map assault target (forcefield 5× hull)
+        blips.push({
+          x: norm(e.px), y: norm(e.pz), kind: "carrier",
+          color: e.team === ENEMY.team ? "#ff3b30" : "#ff8844",
+          id: e.id,
+          label: e.team === ENEMY.team ? "Hostile capital" : "Rival capital",
+          mission: true,
+        });
       } else if (e.team === ENEMY.team) {
         blips.push({ x: norm(e.px), y: norm(e.pz), kind: "enemy", color: "#ff3b30" });
       }
@@ -3091,6 +3200,38 @@ const _bdir = new THREE.Vector3();
 const _bup = new THREE.Vector3(0, 1, 0);
 const _bquat = new THREE.Quaternion();
 const _spinQ = new THREE.Quaternion();
+
+/** Client VFX colour by attack style (matches ROLE_ATTACK SSOT). */
+function projectileStyleColor(style: string | undefined, isMissile: boolean): string {
+  if (isMissile) return "#ff6622";
+  switch (style) {
+    case "pulse": return "#66ccff";
+    case "plasma": return "#aa66ff";
+    case "flak": return "#ffcc44";
+    case "rail": return "#ffffff";
+    case "beam": return "#44ffaa";
+    case "laser":
+    default: return "#ffaa44";
+  }
+}
+
+function styleTrailEffect(style: string | undefined): string {
+  switch (style) {
+    case "plasma": return "fireCast";
+    case "flak": return "fireSparks";
+    case "rail": return "muzzleFlash";
+    default: return "fireSparks";
+  }
+}
+
+function styleTrailScale(style: string | undefined): number {
+  switch (style) {
+    case "rail": return 1.8;
+    case "plasma": return 1.6;
+    case "flak": return 1.5;
+    default: return 1.4;
+  }
+}
 
 /** Flat 4-point throwing-star (shuriken) in the XY plane, normal +Z, centred. */
 function makeShurikenGeometry(radius: number): THREE.BufferGeometry {
