@@ -47,6 +47,10 @@ export function attachCarrierServer(server: Server): void {
         room.summon(id, msg.entityId);
       } else if (msg.t === "build") {
         room.build(id, msg.kind);
+      } else if (msg.t === "navigate") {
+        room.navigate(id, msg.tx, msg.ty, msg.tz, msg.celestialId);
+      } else if (msg.t === "produce") {
+        room.produce(id);
       }
     });
 

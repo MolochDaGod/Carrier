@@ -38,7 +38,11 @@ export type ClientMessage =
    */
   | { t: "summon"; entityId: string }
   /** Build one platform of `kind` and tether it to the owned mothership. */
-  | { t: "build"; kind: PlatformKind };
+  | { t: "build"; kind: PlatformKind }
+  /** Order the mothership to navigate to a world point (map click / mission). */
+  | { t: "navigate"; tx: number; ty: number; tz: number; celestialId?: string }
+  /** Start fabricating one level-1 craft at the rock node (miner) if idle. */
+  | { t: "produce" };
 
 export type ServerMessage =
   | {
@@ -94,6 +98,17 @@ export function decodeClient(raw: string): ClientMessage | null {
     // `build` must name a real platform kind, or the economy/spawn maths break.
     if (m.t === "build" && !isPlatformKind((m as { kind?: unknown }).kind)) {
       return null;
+    }
+    if (m.t === "navigate") {
+      const n = m as { tx?: unknown; ty?: unknown; tz?: unknown; celestialId?: unknown };
+      if (
+        typeof n.tx !== "number" || !Number.isFinite(n.tx)
+        || typeof n.ty !== "number" || !Number.isFinite(n.ty)
+        || typeof n.tz !== "number" || !Number.isFinite(n.tz)
+      ) return null;
+      if (n.celestialId !== undefined && (typeof n.celestialId !== "string" || n.celestialId.length > 64)) {
+        return null;
+      }
     }
     return m;
   } catch {

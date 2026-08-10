@@ -20,10 +20,19 @@
  */
 import * as THREE from "three";
 import { loadAsset, type LoadedModel } from "@workspace/assets";
-import { mechFor, type MechDef } from "./mechs";
+import { MOTHERSHIPS, type MothershipDef, type TurretMount } from "./motherships";
 
-/** Target longest-side fit (arbitrary preview units), matching the hangar showcase. */
-const HULL_FIT = 58;
+const PLATFORM_ID = "environment/carrier/cyberpunk-platform-b";
+const DEFAULT_HULL_ID = "vehicles/space/carrier/spaceship";
+const TURRET_IDS = [
+  "props/carrier/turret-gun",
+  "props/carrier/turret-cannon",
+] as const;
+
+/** Target longest-side fit (arbitrary preview units), matching the showcase. */
+const PLATFORM_FIT = 60;
+const HULL_FIT = 34;
+const TURRET_FIT = 9;
 
 /** Cinematic timeline (seconds). After DECEL the orbit runs indefinitely. */
 const WARP_DUR = 1.5;
@@ -36,8 +45,10 @@ const TUNNEL_LEN = 2200;
 const TUNNEL_RADIUS = 420;
 const WARP_SPEED = 2100; // world units / second at full warp
 
-function hullIdFor(def: MechDef): string {
-  return def.hull;
+/** Resolve the hull catalog id for a mothership def (forward-compatible). */
+function hullIdFor(def: MothershipDef): string {
+  const maybe = (def as { model?: unknown }).model;
+  return typeof maybe === "string" && maybe.length > 0 ? maybe : DEFAULT_HULL_ID;
 }
 
 export interface CarrierIntroOpts {
@@ -48,7 +59,7 @@ export interface CarrierIntroOpts {
 export class CarrierIntro {
   private readonly container: HTMLElement;
   private readonly opts: CarrierIntroOpts;
-  private readonly def: MechDef;
+  private readonly def: MothershipDef;
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
@@ -82,7 +93,7 @@ export class CarrierIntro {
   constructor(container: HTMLElement, opts: CarrierIntroOpts) {
     this.container = container;
     this.opts = opts;
-    this.def = mechFor(opts.shipType);
+    this.def = MOTHERSHIPS[opts.shipType] ?? MOTHERSHIPS[0];
 
     const w = container.clientWidth || 1;
     const h = container.clientHeight || 1;
@@ -143,14 +154,19 @@ export class CarrierIntro {
   /** Load the composition assets and build the mothership. Resolves when ready. */
   async init(): Promise<void> {
     const hullId = hullIdFor(this.def);
-    try {
-      const model = await loadAsset(hullId);
-      if (this.disposed) return;
-      if (model) this.models[hullId] = model;
-    } catch {
-      /* procedural fallback in buildMech */
-    }
-    this.buildMech(hullId);
+    const ids = [PLATFORM_ID, hullId, ...TURRET_IDS];
+    const loaded = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          return [id, await loadAsset(id)] as const;
+        } catch {
+          return [id, null] as const;
+        }
+      }),
+    );
+    if (this.disposed) return;
+    for (const [id, model] of loaded) if (model) this.models[id] = model;
+    this.buildMothership(hullId);
   }
 
   start(): void {
@@ -259,32 +275,53 @@ export class CarrierIntro {
 
   // --- composition -----------------------------------------------------------
 
-  private buildMech(hullId: string): void {
+  private buildMothership(hullId: string): void {
     const def = this.def;
-    const accent = new THREE.Color(this.opts.factionColor);
+    const accent = new THREE.Color(def.accent);
     const group = new THREE.Group();
 
+    const platform = this.cloneFit(PLATFORM_ID, PLATFORM_FIT, accent, 0.12);
+    if (platform) {
+      platform.scale.multiplyScalar(def.hullScale);
+      group.add(platform);
+    }
+    const platformR = (PLATFORM_FIT * def.hullScale) / 2;
+
     const hull = this.cloneFit(hullId, HULL_FIT * def.hullScale, accent, 0.35);
-    if (hull) group.add(hull);
+    if (hull) {
+      hull.position.y = 10 * def.hullScale;
+      group.add(hull);
+    }
+
+    def.turrets.forEach((mount, i) => {
+      const turret = this.cloneTurret(mount, accent);
+      if (!turret) return;
+      const ang = (i / Math.max(1, def.turrets.length)) * Math.PI * 2 + Math.PI / 4;
+      const r = platformR * 0.62;
+      turret.position.set(Math.cos(ang) * r, 3.5 * def.hullScale, Math.sin(ang) * r);
+      group.add(turret);
+    });
 
     if (group.children.length === 0) {
       group.add(makeFallbackHull(accent, def.hullScale));
     }
 
-    group.updateMatrixWorld(true);
-    const box = new THREE.Box3().setFromObject(group);
-    const center = new THREE.Vector3();
-    const size = new THREE.Vector3();
-    box.getCenter(center);
-    box.getSize(size);
-    group.position.sub(center);
-
     this.composite = group;
     this.rig.add(group);
 
-    const radius = 0.5 * Math.max(size.x, size.y, size.z) || 40;
-    this.centerY = 0;
-    this.frameDist = Math.max(110, radius * 2.4);
+    // Frame the orbit around the assembled hull.
+    this.centerY = 8 * def.hullScale;
+    this.frameDist = Math.max(110, platformR * 3.1);
+  }
+
+  private cloneTurret(mount: TurretMount, accent: THREE.Color): THREE.Object3D | null {
+    const tint =
+      mount.role === "combat"
+        ? new THREE.Color("#ff5d5d")
+        : mount.role === "healing"
+          ? new THREE.Color("#5dff9b")
+          : accent;
+    return this.cloneFit(mount.model, TURRET_FIT, tint, 0.5);
   }
 
   /** Clone a catalog model, recentre on the floor, fit to `fit`, tint emissive. */

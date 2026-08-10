@@ -20,6 +20,7 @@ import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { loadAsset, type LoadedModel } from "@workspace/assets";
 import { type FactionId } from "@workspace/carrier-net";
+import { cloneShipGraph } from "./hullFactory";
 import { autoOrientShip, fitObject, tintMetal } from "./modelFit";
 
 /** A single ship "slot" the user can preview a default for and import into. */
@@ -27,10 +28,12 @@ export interface ShipSlot {
   /** Override storage key (real asset id for ships, primary part id for stations). */
   key: string;
   label: string;
+  /** One-line role hint shown in the Shipyard sidebar. */
+  hint?: string;
   group: string;
   /** Longest-axis fit length (metres) — matches the live game for this slot. */
   fit: number;
-  kind: "fighter" | "fleet" | "station";
+  kind: "fighter" | "fleet" | "station" | "mothership" | "platform" | "turret" | "rock";
   /** Asset ids to load for the DEFAULT (in-game) preview. */
   catalogIds: string[];
   /** Manual Y-rotation for ship hulls; omit to auto-orient nose → +Z. */
@@ -141,6 +144,12 @@ export class ShipyardInspector {
     this.lastSlot = slot;
     this.lastFile = null;
     const token = ++this.loadToken;
+    if (slot.catalogIds.length === 0) {
+      this.onState({ status: "empty" });
+      this.swap(this.buildPlaceholder(slot), false);
+      this.frame(this.current!);
+      return;
+    }
     this.onState({ status: "loading", source: "default" });
 
     Promise.all(slot.catalogIds.map((id) => loadAsset(id)))
@@ -196,6 +205,20 @@ export class ShipyardInspector {
     }
   }
 
+  /** Wireframe placeholder when a slot has no baked default (planned imports). */
+  private buildPlaceholder(slot: ShipSlot): THREE.Object3D {
+    const geo = new THREE.IcosahedronGeometry(slot.fit * 0.15, 1);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x3a4a62,
+      wireframe: true,
+      emissive: 0x00d4ff,
+      emissiveIntensity: 0.15,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.userData.sharedGeo = false;
+    return mesh;
+  }
+
   /** Assemble + orient + fit + tint a catalog asset the same way the game does. */
   private buildCatalog(slot: ShipSlot, models: LoadedModel[]): THREE.Object3D {
     if (slot.kind === "station") {
@@ -205,7 +228,7 @@ export class ShipyardInspector {
       fitObject(assembly, slot.fit);
       return assembly;
     }
-    const clone = models[0].scene.clone(true);
+    const clone = cloneShipGraph(models[0].scene);
     if (slot.yaw === undefined) autoOrientShip(clone);
     else clone.rotation.y = slot.yaw;
     tintMetal(clone, this.tintFaction, false);

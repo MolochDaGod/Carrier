@@ -84,8 +84,17 @@ export function tintMetal(root: THREE.Object3D, faction: FactionId, station: boo
     const hasUV = !!o.geometry.getAttribute("uv");
     const src = Array.isArray(o.material) ? o.material : [o.material];
     const next = src.map((mm) => {
+      const map = hasUV ? (mm as THREE.MeshStandardMaterial).map ?? null : null;
+      if (mm instanceof THREE.MeshBasicMaterial && map) {
+        return new THREE.MeshBasicMaterial({
+          map,
+          color: 0xffffff,
+          transparent: mm.transparent,
+          opacity: mm.opacity,
+          side: mm.side,
+        });
+      }
       const base = mm as THREE.MeshStandardMaterial;
-      const map = hasUV ? base.map ?? null : null;
       return new THREE.MeshStandardMaterial({
         map,
         color: map ? 0xffffff : 0x707886,

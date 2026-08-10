@@ -12,18 +12,33 @@
  * hull dossier — stats, special, perks, flaws, turrets (ships view).  Footer:
  * callsign + Launch (ships view only).
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { FACTIONS, FACTION_ORDER, type FactionId } from "@workspace/carrier-net";
 import { FactionEmblem } from "../components/FactionEmblem";
 import { HangarAtmosphere } from "../components/HangarAtmosphere";
 import { MothershipShowcase, type ShowcaseSlot } from "./MothershipShowcase";
 import { FleetRosterPanel } from "./FleetRosterPanel";
 import {
+  MOTHERSHIPS,
   FACTION_ACCENT,
+  TURRET_ROLE_COLOR,
   STAT_META,
+  type MothershipDef,
   type ShipStats,
 } from "./motherships";
-import { STARTER_MECHS, mechFor, type MechDef } from "./mechs";
+import { mothershipFor } from "./factionShips";
+import {
+  getWarmupState,
+  isWarmupReady,
+  subscribeWarmup,
+  warmupFactionAssets,
+} from "./factionAssetWarmup";
+
+/**
+ * The player's current build tier. Starts at 1 (only Tier-1 hulls buildable);
+ * later phases raise this as the mothership is upgraded with crystals.
+ */
+const PLAYER_TIER = 1;
 
 type NavView = "factions" | "ships";
 
@@ -61,7 +76,15 @@ export function MothershipSelect({
   // Bumped after any override change so the cog menu re-reads `hasOverride`.
   const [overrideTick, setOverrideTick] = useState(0);
 
-  const def = mechFor(shipType);
+  const def = mothershipFor(faction, shipType);
+  const locked = def.tier > PLAYER_TIER;
+  const warmup = useSyncExternalStore(subscribeWarmup, getWarmupState, getWarmupState);
+  const assetsReady = isWarmupReady();
+
+  // Staged preload: station shells + six fleet GLBs before launch (CDN or bundle).
+  useEffect(() => {
+    void warmupFactionAssets(faction);
+  }, [faction]);
 
   // Latest shipType for the auto-review interval (which only mounts once).
   const shipTypeRef = useRef(shipType);
@@ -81,9 +104,8 @@ export function MothershipSelect({
         if (cancelled) return;
         setReady(true);
         showcase.select(
-          mechFor(shipTypeRef.current),
+          mothershipFor(faction, shipTypeRef.current),
           FACTION_ACCENT[faction] ?? factionDef.color,
-          faction,
         );
         // Reapply any custom models saved on a previous visit.
         await showcase.loadPersistedOverrides();
@@ -100,16 +122,18 @@ export function MothershipSelect({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Swap the displayed hull when the hull, faction, or tint changes.
+  // Swap the displayed hull when the hull OR the faction tint changes.
+  // Key on faction + shipType (not `def`) — mothershipFor() returns a fresh object every render.
   useEffect(() => {
-    if (ready) showcaseRef.current?.select(def, accent, faction);
-  }, [ready, def, accent, faction]);
+    if (ready) showcaseRef.current?.select(mothershipFor(faction, shipType), accent);
+  }, [ready, faction, shipType, accent]);
 
-  // Review mode: auto-advance through all three mechs hands-free.
+  // Review mode: auto-advance through all six hulls so the player can cycle the
+  // whole roster hands-free; any manual pick keeps the latest in shipTypeRef.
   useEffect(() => {
     if (!reviewing) return;
     const t = setInterval(() => {
-      const n = STARTER_MECHS.length;
+      const n = MOTHERSHIPS.length;
       setShipType((shipTypeRef.current + 1) % n);
     }, 3200);
     return () => clearInterval(t);
@@ -117,7 +141,7 @@ export function MothershipSelect({
   }, [reviewing]);
 
   const cycle = (dir: number) => {
-    const n = STARTER_MECHS.length;
+    const n = MOTHERSHIPS.length;
     setShipType((shipType + dir + n) % n);
   };
 
@@ -154,7 +178,15 @@ export function MothershipSelect({
 
   const pickFaction = (id: FactionId) => {
     setFaction(id);
-    // Picking a faction re-tints the showcase; "Choose Mech →" advances to mech pick.
+    // Picking a faction only re-tints the centre showcase + refreshes the right
+    // dossier; it stays on the faction list (no tab switch). The right-side
+    // "View Fleet →" button is what advances to the ships view. Keep the
+    // selection on a buildable (Tier-1) hull so the fleet never opens on a
+    // locked/stale selection with Launch already disabled.
+    if (def.tier > PLAYER_TIER) {
+      const firstUnlocked = MOTHERSHIPS.find((m) => m.tier <= PLAYER_TIER);
+      if (firstUnlocked) setShipType(firstUnlocked.id);
+    }
   };
 
   return (
@@ -208,6 +240,7 @@ export function MothershipSelect({
             <FactionList faction={faction} onPick={pickFaction} />
           ) : (
             <ShipList
+              factionId={faction}
               faction={factionDef}
               shipType={shipType}
               setShipType={setShipType}
@@ -270,7 +303,7 @@ export function MothershipSelect({
               {reviewing ? "■ Reviewing All" : "▶ Review All"}
             </button>
             <div className="flex items-center gap-1">
-              {STARTER_MECHS.map((m) => (
+              {MOTHERSHIPS.map((m) => (
                 <span
                   key={m.id}
                   className="h-1.5 w-1.5 rounded-full transition-all"
@@ -290,7 +323,14 @@ export function MothershipSelect({
                 <div className="border-b border-white/10 px-3 py-2 text-[9px] uppercase tracking-[0.3em] text-white/40">
                   Replace Asset
                 </div>
-                {([["hull", "Mech Hull"]] as [ShowcaseSlot, string][]).map(([slot, label]) => {
+                {(
+                  [
+                    ["hull", "Hull"],
+                    ["platform", "Platform"],
+                    ["turret-gun", "Turret · Gun"],
+                    ["turret-cannon", "Turret · Cannon"],
+                  ] as [ShowcaseSlot, string][]
+                ).map(([slot, label]) => {
                   const custom = showcaseRef.current?.hasOverride(slot) ?? false;
                   return (
                     <div
@@ -363,7 +403,7 @@ export function MothershipSelect({
           {view === "factions" ? (
             <FactionDossier faction={factionDef} onEnter={() => setView("ships")} />
           ) : (
-            <MechDossier def={def} />
+            <ShipDossier def={def} />
           )}
         </aside>
       </div>
@@ -385,9 +425,16 @@ export function MothershipSelect({
               />
             </div>
             <div className="flex items-center gap-4">
+              {locked && (
+                <span className="text-[11px] uppercase tracking-widest text-[#ff7a7a]/80">
+                  🔒 {def.name} is Tier {def.tier} — unlock via mothership upgrades
+                </span>
+              )}
+              <HangarAssetWarmup state={warmup} />
               <button
                 onClick={onLaunch}
-                className="rounded-md border-2 px-10 py-2.5 text-sm font-bold uppercase tracking-[0.25em] transition-colors"
+                disabled={locked || !assetsReady}
+                className="rounded-md border-2 px-10 py-2.5 text-sm font-bold uppercase tracking-[0.25em] transition-colors disabled:cursor-not-allowed disabled:opacity-40"
                 style={{
                   borderColor: factionDef.color,
                   background: `${factionDef.color}1f`,
@@ -399,8 +446,11 @@ export function MothershipSelect({
             </div>
           </>
         ) : (
-          <div className="flex w-full items-center justify-center text-[11px] uppercase tracking-[0.3em] text-white/35">
-            Select a faction, then choose your starter mech
+          <div className="flex w-full items-center justify-between gap-4">
+            <HangarAssetWarmup state={warmup} className="flex-1" />
+            <span className="shrink-0 text-[11px] uppercase tracking-[0.3em] text-white/35">
+              Select a faction to view its fleet
+            </span>
           </div>
         )}
       </footer>
@@ -444,7 +494,7 @@ function FactionList({
                 {f.name}
               </span>
               <span className="block text-[10px] uppercase tracking-widest text-white/35">
-                3 Mechs
+                6 Hulls
               </span>
             </span>
             <span className="shrink-0 text-white/25 transition-transform group-hover:translate-x-0.5">
@@ -460,11 +510,13 @@ function FactionList({
 /* ── Left rail: ships of the chosen faction ──────────────────────────────── */
 
 function ShipList({
+  factionId,
   faction,
   shipType,
   setShipType,
   onBack,
 }: {
+  factionId: FactionId;
   faction: { name: string; color: string };
   shipType: number;
   setShipType: (v: number) => void;
@@ -484,12 +536,14 @@ function ShipList({
           {faction.name}
         </span>
         <span className="ml-auto text-[10px] uppercase tracking-widest text-white/30">
-          Mechs
+          Fleet
         </span>
       </button>
       <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3">
-        {STARTER_MECHS.map((m) => {
+        {MOTHERSHIPS.map((m) => {
+          const fm = mothershipFor(factionId, m.id);
           const active = m.id === shipType;
+          const mLocked = m.tier > PLAYER_TIER;
           return (
             <button
               key={m.id}
@@ -498,6 +552,7 @@ function ShipList({
               style={{
                 borderColor: active ? m.accent : "transparent",
                 background: active ? `${m.accent}14` : "transparent",
+                opacity: mLocked && !active ? 0.55 : 1,
               }}
             >
               <span
@@ -511,13 +566,23 @@ function ShipList({
               <span className="flex-1">
                 <span
                   className="block text-sm font-semibold tracking-wide"
-                  style={{ color: active ? m.accent : "#cdd8ee" }}
-                >
-                  {m.name}
+                style={{ color: active ? fm.accent : "#cdd8ee" }}
+              >
+                  {fm.name}
                 </span>
                 <span className="block text-[10px] uppercase tracking-widest text-white/35">
-                  {m.role}
+                  {fm.role}
                 </span>
+              </span>
+              <span
+                className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
+                style={{
+                  color: mLocked ? "#8a93a8" : m.accent,
+                  background: mLocked ? "rgba(255,255,255,0.06)" : `${m.accent}1f`,
+                }}
+                title={mLocked ? `Tier ${m.tier} — unlock via mothership upgrades` : `Tier ${m.tier}`}
+              >
+                {mLocked ? `🔒 T${m.tier}` : `T${m.tier}`}
               </span>
             </button>
           );
@@ -567,7 +632,7 @@ function FactionDossier({
           color: faction.color,
         }}
       >
-        Choose Mech →
+        View Fleet →
       </button>
     </>
   );
@@ -575,26 +640,16 @@ function FactionDossier({
 
 /* ── Right panel: hull dossier ───────────────────────────────────────────── */
 
-function MechDossier({ def }: { def: MechDef }) {
+function ShipDossier({ def }: { def: MothershipDef }) {
   return (
     <>
-      <div>
-        <h2
-          className="text-xl font-bold uppercase tracking-[0.15em]"
-          style={{ color: def.accent }}
-        >
-          {def.name}
-        </h2>
-        <p className="mt-1 text-xs italic text-white/50">{def.tagline}</p>
-      </div>
-
       <p className="text-sm leading-relaxed text-white/70">{def.description}</p>
 
       <StatBlock stats={def.stats} />
 
       <div>
         <h3 className="mb-2 text-[11px] uppercase tracking-[0.3em] text-[#ffd23f]">
-          Signature
+          Special
         </h3>
         <p className="text-sm leading-relaxed text-white/75">{def.special}</p>
       </div>
@@ -617,17 +672,34 @@ function MechDossier({ def }: { def: MechDef }) {
         ))}
       </Section>
 
-      <p className="text-[11px] leading-relaxed text-white/40">
-        Customise this frame in the{" "}
-        <a
-          href="?shipyard"
-          className="text-[#00d4ff]/80 underline-offset-2 hover:text-[#00d4ff] hover:underline"
-        >
-          Shipyard
-        </a>{" "}
-        (mech builder) — uploads are saved on this device and override the hull
-        you fly in matches.
-      </p>
+      <div>
+        <h3 className="mb-2 text-[11px] uppercase tracking-[0.3em] text-white/40">
+          Turret Systems
+        </h3>
+        <div className="flex flex-col gap-2">
+          {def.turrets.map((t, i) => (
+            <div
+              key={i}
+              className="flex items-center justify-between rounded-md border border-white/10 bg-black/30 px-3 py-2"
+            >
+              <span className="text-sm text-white/80">{t.label}</span>
+              <span
+                className="rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest"
+                style={{
+                  color: TURRET_ROLE_COLOR[t.role],
+                  background: `${TURRET_ROLE_COLOR[t.role]}1f`,
+                }}
+              >
+                {t.role}
+              </span>
+            </div>
+          ))}
+        </div>
+        <p className="mt-2 text-[11px] leading-relaxed text-white/35">
+          Every mothership carries the platform + turret framework; only the
+          loadout differs.
+        </p>
+      </div>
     </>
   );
 }
@@ -659,6 +731,60 @@ function StatBlock({ stats }: { stats: ShipStats }) {
             </span>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+/** Hangar staged preload — critical station shells, then fleet hulls. */
+function HangarAssetWarmup({
+  state,
+  className = "",
+}: {
+  state: ReturnType<typeof getWarmupState>;
+  className?: string;
+}) {
+  if (state.phase === "idle") return null;
+  const pct = Math.round(state.fraction * 100);
+  const phaseLabel =
+    state.phase === "critical"
+      ? "Station"
+      : state.phase === "fleet"
+        ? "Fleet"
+        : state.phase === "done"
+          ? "Ready"
+          : state.phase === "error"
+            ? "Partial"
+            : "Loading";
+  const barColor =
+    state.phase === "error"
+      ? "#ff9d3f"
+      : state.phase === "done"
+        ? "#5dff9b"
+        : "#00d4ff";
+  return (
+    <div className={`flex min-w-0 items-center gap-3 ${className}`}>
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-[0.25em] text-white/45">
+          <span>
+            Assets · {phaseLabel}
+            {state.cdn ? " · CDN" : ""}
+          </span>
+          <span className="tabular-nums">
+            {state.loaded}/{state.total} · {pct}%
+          </span>
+        </div>
+        <div className="h-1 overflow-hidden rounded-full bg-white/10">
+          <div
+            className="h-full rounded-full transition-all duration-300"
+            style={{ width: `${pct}%`, background: barColor, boxShadow: `0 0 8px ${barColor}66` }}
+          />
+        </div>
+        {state.failures.length > 0 && (
+          <div className="mt-1 truncate text-[9px] text-[#ff9d3f]">
+            {state.failures.length} asset(s) will use fallback geometry
+          </div>
+        )}
       </div>
     </div>
   );

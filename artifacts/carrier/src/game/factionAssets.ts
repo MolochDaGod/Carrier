@@ -107,13 +107,23 @@ export function fleetModelFor(faction: FactionId, role: DeployRole): ShipModel {
   return FLEET_BY_FACTION[faction][role];
 }
 
-/** Player / enemy fighter hulls (the entry hull before becoming a fleet unit). */
+/**
+ * Cosmetic spawn-shell hulls — friendly vs hostile fighters, not deployable fleet
+ * classes. Every player still fields all six fleet roles; these only skin the
+ * small craft you personally fly (or hostiles use) before/instead of capital play.
+ */
 export const FIGHTER_GLB: { player: ShipModel; enemy: ShipModel } = {
   // fighter-player is authored nose-toward local -Z; force the half-turn so the
   // player ship doesn't fly tail-first. The enemy hull auto-orients fine.
   player: { id: "vehicles/space/fighters/fighter-player", yaw: Math.PI },
   enemy: { id: "vehicles/space/fighters/interceptor-red/interceptor-red" },
 };
+
+/** Shipyard / inspector labels for the two spawn-shell slots keyed in FIGHTER_GLB. */
+export const SPAWN_SHELL_SLOTS = [
+  { key: "player" as const, label: "Your Craft", hint: "Friendly fighter hull" },
+  { key: "enemy" as const, label: "Hostile Craft", hint: "Enemy fighters & boss" },
+] as const;
 
 /**
  * Per-faction mothership station.  Each station is one or more OBJ parts that

@@ -2,7 +2,7 @@
  * hullOverrides — make user-uploaded ship models show up in the LIVE game.
  *
  * The Shipyard ({@link ../pages/Shipyard}) lets the player replace any ship slot
- * (player/enemy fighter, every fleet hull, every faction station) with their own
+ * (spawn shells, every fleet hull, faction capital station) with their own
  * `.glb`/`.gltf`, persisted per-device in IndexedDB (keyed by the slot's catalog
  * asset id) via {@link ./shipModelStore}. But until those overrides are read back
  * at render time, a "saved" replacement only ever showed up in the Shipyard

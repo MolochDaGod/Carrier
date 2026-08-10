@@ -13,8 +13,9 @@
  * renderer, scenes, RAF loop, and resize observer and frees them in dispose().
  */
 import * as THREE from "three";
-import type { FactionId } from "@workspace/carrier-net";
+import { factionFleetShip, type FactionId } from "@workspace/carrier-net";
 import { DEPLOY_ROLES, fleetModelFor } from "./factionAssets";
+import { fleetDebug } from "./fleetDebug";
 import { disposeGroup, loadHullModel } from "./hullFactory";
 
 /** Grid layout — six deployable classes in two columns, three rows. */
@@ -93,15 +94,25 @@ export class FleetRosterShowcase {
     this.faction = faction;
     const mySeq = ++this.buildSeq;
 
-    const built = await Promise.all(
-      ROSTER_ROLES.map(async (role) => {
-        try {
-          return await loadHullModel(fleetModelFor(faction, role), faction, CELL_FIT);
-        } catch {
-          return null;
-        }
-      }),
-    );
+    // Load sequentially — brood hulls are large; parallel loads exhaust browser
+    // resources and silently drop cells (e.g. corsair Void Core).
+    const built: (THREE.Object3D | null)[] = [];
+    for (const role of ROSTER_ROLES) {
+      const model = fleetModelFor(faction, role);
+      const dbgKey = `roster:${faction}:${role}`;
+      try {
+        built.push(await loadHullModel(model, faction, CELL_FIT, {
+          key: dbgKey,
+          assetId: model.id,
+          faction,
+          role,
+          source: "roster",
+        }));
+      } catch (err) {
+        fleetDebug.fallback(dbgKey, err instanceof Error ? err.message : String(err));
+        built.push(null);
+      }
+    }
     if (this.disposed || mySeq !== this.buildSeq) {
       // A newer faction won the race — drop the stale clones.
       for (const obj of built) if (obj) disposeGroup(obj);

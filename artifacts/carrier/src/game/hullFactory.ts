@@ -1,23 +1,75 @@
 /**
- * hullFactory — the single shared render path for Carrier hull/station models.
+ * hullFactory — **singular ship prefab pattern** for Carrier (SSOT).
  *
- * Both the live game engine (`CarrierGame`) and the dev-only mothership
- * inspector (`MothershipInspector`) build their fighter/fleet/station meshes
- * from these helpers, so what the inspector shows at true relative scale matches
- * exactly what spawns in gameplay. Keep these pure (no engine/scene state) so
- * neither caller drifts from the other.
+ * All hulls (fighter shells, six fleet roles × five factions, six mothership
+ * class hulls, capital stations) resolve through ONE path:
  *
- * The fit formula is the contract: a station is normalised to
- *   SHIP_FIT * MOTHER_SHIP.scaleFactor * fitMul
- * (its longest axis), a fighter to SHIP_FIT, and a fleet unit to its role scale.
+ *   fleetModelFor(faction, role) | FIGHTER_GLB | FACTION_STATIONS
+ *     → loadHullModel / loadStationModel
+ *     → cloneShipGraph (SkeletonUtils for skinned)
+ *     → tintMetalHull + fitObject + hullYawTune
+ *     → shipyard overrides via getOverrideTemplate(assetId)
+ *
+ * Call sites that MUST use this factory (do not invent parallel loaders):
+ *   - `CarrierGame` (live match)
+ *   - `MothershipInspector` / `MothershipShowcase` / `FleetRosterShowcase`
+ *   - `Shipyard` / `ShipyardInspector` (import/preview)
+ *   - Captain roster / become / deploy (same GLB ids as shipyardCatalog)
+ *
+ * Both the live game engine (`CarrierGame`) and the mothership inspector build
+ * meshes from these helpers so hangar scale matches gameplay. Keep pure
+ * (no engine/scene state).
+ *
+ * Fit contract: station = SHIP_FIT * MOTHER_SHIP.scaleFactor * fitMul;
+ * fighter = SHIP_FIT; fleet unit = role scale.
  */
 import * as THREE from "three";
+import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 import { loadAsset, type LoadedModel } from "@workspace/assets";
 import { FACTIONS, MOTHER_SHIP, type FactionId } from "@workspace/carrier-net";
 import { FACTION_STATIONS, type ShipModel } from "./factionAssets";
 import { FACTION_ACCENT } from "./motherships";
 import { SHIP_FIT } from "./constants";
 import { ensureOverridesPrimed, getOverrideTemplate } from "./hullOverrides";
+import { getHullYawTune } from "./hullYawStore";
+import { fleetDebug, type FleetHullLoadCtx } from "./fleetDebug";
+
+/** Rigged fleet hulls — must use SkeletonUtils.clone, not Object3D.clone(true). */
+export const SKINNED_HULL_IDS = new Set([
+  "vehicles/space/brood/void-core",
+  "vehicles/space/brood/leviathan",
+]);
+
+/** True when the graph contains at least one SkinnedMesh. */
+export function hasSkinnedMesh(root: THREE.Object3D): boolean {
+  let found = false;
+  root.traverse((o) => {
+    if (o instanceof THREE.SkinnedMesh) found = true;
+  });
+  return found;
+}
+
+/**
+ * Clone a hull scene for a live instance. Skinned GLBs (Void Core, Leviathan)
+ * need SkeletonUtils so bones/bind matrices stay valid — a plain clone(true)
+ * collapses them and the load path silently keeps the procedural cone.
+ */
+export function cloneShipGraph(src: THREE.Object3D): THREE.Object3D {
+  const skinned = hasSkinnedMesh(src);
+  const clone = skinned ? cloneSkinned(src) : src.clone(true);
+  if (skinned) refreshSkinnedMeshes(clone);
+  return clone;
+}
+
+/** Rebind skinned meshes after clone so bind-pose geometry is visible. */
+export function refreshSkinnedMeshes(root: THREE.Object3D): void {
+  root.traverse((o) => {
+    if (o instanceof THREE.SkinnedMesh) {
+      o.skeleton.pose();
+      o.updateMatrixWorld(true);
+    }
+  });
+}
 
 /** Longest-axis fit length used for a faction's station, matching gameplay. */
 export function stationFit(faction: FactionId): number {
@@ -46,6 +98,7 @@ export async function loadStationModel(faction: FactionId): Promise<THREE.Group>
   }
   tintMetalHull(assembly, faction, true);
   fitObject(assembly, stationFit(faction));
+  assembly.rotation.y += getHullYawTune(def.parts[0]);
   return assembly;
 }
 
@@ -57,19 +110,32 @@ export async function loadHullModel(
   model: ShipModel,
   faction: FactionId,
   fit: number,
+  debug?: FleetHullLoadCtx,
 ): Promise<THREE.Object3D> {
-  await ensureOverridesPrimed();
-  // Prefer a saved Shipyard replacement for this slot; else the catalog default.
-  // Orientation/tint/fit are applied identically either way, so what the Shipyard
-  // preview shows for this model id is what spawns here.
-  const override = getOverrideTemplate(model.id);
-  const src = override ?? (await loadAsset(model.id) as LoadedModel).scene;
-  const clone = src.clone(true);
-  if (model.yaw === undefined) autoOrientShip(clone);
-  else clone.rotation.y = model.yaw;
-  tintMetalHull(clone, faction, false);
-  fitObject(clone, fit);
-  return clone;
+  const dbgKey = debug?.key;
+  if (debug && dbgKey) {
+    if (!fleetDebug.get(dbgKey)) fleetDebug.start(debug);
+    fleetDebug.attempt(dbgKey);
+  }
+
+  try {
+    await ensureOverridesPrimed();
+    // Prefer a saved Shipyard replacement for this slot; else the catalog default.
+    const override = getOverrideTemplate(model.id);
+    const src = override ?? (await loadAsset(model.id) as LoadedModel).scene;
+    const clone = cloneShipGraph(src);
+    if (model.yaw === undefined) autoOrientShip(clone);
+    else clone.rotation.y = model.yaw;
+    clone.rotation.y += getHullYawTune(model.id);
+    tintMetalHull(clone, faction, false);
+    fitObject(clone, fit);
+    refreshSkinnedMeshes(clone);
+    if (dbgKey) fleetDebug.success(dbgKey);
+    return clone;
+  } catch (err) {
+    if (dbgKey) fleetDebug.error(dbgKey, err);
+    throw err;
+  }
 }
 
 /**
@@ -102,8 +168,19 @@ export function tintMetalHull(
     const hasUV = !!o.geometry.getAttribute("uv");
     const src = Array.isArray(o.material) ? o.material : [o.material];
     const next = src.map((mm) => {
+      const map = hasUV ? (mm as THREE.MeshStandardMaterial).map ?? null : null;
+      // Brood Void Core uses KHR_materials_unlit + embedded atlas — keep Basic
+      // so the organic texture reads; PBR replacement made it look missing.
+      if (mm instanceof THREE.MeshBasicMaterial && map) {
+        return new THREE.MeshBasicMaterial({
+          map,
+          color: 0xffffff,
+          transparent: mm.transparent,
+          opacity: mm.opacity,
+          side: mm.side,
+        });
+      }
       const base = mm as THREE.MeshStandardMaterial;
-      const map = hasUV ? base.map ?? null : null;
       return new THREE.MeshStandardMaterial({
         map,
         color: map ? 0xffffff : station ? 0x6b7480 : 0x707886,
@@ -118,50 +195,8 @@ export function tintMetalHull(
   });
 }
 
-/**
- * Hangar / showcase hull: full PBR textures from the asset pipeline, subtle
- * faction emissive trim only (no flat metal wash).
- */
-export async function loadShowcaseHull(
-  model: ShipModel,
-  faction: FactionId,
-  fit: number,
-): Promise<THREE.Object3D> {
-  await ensureOverridesPrimed();
-  const override = getOverrideTemplate(model.id);
-  const src = override ?? (await loadAsset(model.id) as LoadedModel).scene;
-  const clone = src.clone(true);
-  if (model.yaw === undefined) autoOrientShip(clone);
-  else clone.rotation.y = model.yaw;
-  applyShowcaseAccent(clone, new THREE.Color(FACTION_ACCENT[faction]));
-  fitObject(clone, fit);
-  return clone;
-}
-
-/** Clone materials so `.map` / normal / roughness survive; add muted rim emissive. */
-function applyShowcaseAccent(root: THREE.Object3D, accent: THREE.Color): void {
-  root.traverse((o) => {
-    if (!(o instanceof THREE.Mesh)) return;
-    o.userData.sharedGeo = true;
-    const src = Array.isArray(o.material) ? o.material : [o.material];
-    const next = src.map((mm) => {
-      const base = mm as THREE.MeshStandardMaterial;
-      const m = base.clone();
-      m.emissive = accent.clone();
-      m.emissiveIntensity = 0.12;
-      m.envMapIntensity = 1.15;
-      if (m.map) m.color.setHex(0xffffff);
-      return m;
-    });
-    o.material = Array.isArray(o.material) ? next : next[0];
-  });
-}
-
 /** Recentre an object on its bounding-box centre and scale so its longest axis = fit. */
 export function fitObject(obj: THREE.Object3D, fit: number): void {
-  // Baked child scales (e.g. platform GLB nodes at 100×) must be in world space
-  // before measuring, or fit computes a wildly wrong scale factor.
-  obj.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(obj);
   const size = new THREE.Vector3();
   const center = new THREE.Vector3();
@@ -190,14 +225,11 @@ export function autoOrientShip(obj: THREE.Object3D): void {
   _aoBox.setFromObject(obj);
   _aoBox.getSize(_aoSize);
   _aoBox.getCenter(_aoCenter);
-  // Pick the hull's longest axis (X, Y, or Z) as the nose-tail line.
-  const axis = _aoSize.x >= _aoSize.y && _aoSize.x >= _aoSize.z ? "x"
-    : _aoSize.y >= _aoSize.z ? "y" : "z";
-  const half = (axis === "x" ? _aoSize.x : axis === "y" ? _aoSize.y : _aoSize.z) * 0.5 || 1;
-  const cut = 0.45 * half;
-  const cLng = axis === "x" ? _aoCenter.x : axis === "y" ? _aoCenter.y : _aoCenter.z;
-  const cPerA = axis === "x" ? _aoCenter.z : axis === "y" ? _aoCenter.x : _aoCenter.x;
-  const cPerB = axis === "x" ? _aoCenter.y : axis === "y" ? _aoCenter.z : _aoCenter.y;
+  const alongX = _aoSize.x >= _aoSize.z;
+  const half = (alongX ? _aoSize.x : _aoSize.z) * 0.5 || 1;
+  const cut = 0.45 * half; // only the outer ~10% of each end votes
+  const cLng = alongX ? _aoCenter.x : _aoCenter.z;
+  const cPer = alongX ? _aoCenter.z : _aoCenter.x;
 
   let total = 0;
   obj.traverse((o) => {
@@ -213,11 +245,8 @@ export function autoOrientShip(obj: THREE.Object3D): void {
     for (let k = 0; k < pos.count; k++, i++) {
       if (i % step !== 0) continue;
       _aoV.fromBufferAttribute(pos, k).applyMatrix4(o.matrixWorld);
-      const lng = (axis === "x" ? _aoV.x : axis === "y" ? _aoV.y : _aoV.z) - cLng;
-      const r = Math.hypot(
-        (axis === "x" ? _aoV.z : axis === "y" ? _aoV.x : _aoV.x) - cPerA,
-        (axis === "x" ? _aoV.y : axis === "y" ? _aoV.z : _aoV.y) - cPerB,
-      );
+      const lng = (alongX ? _aoV.x : _aoV.z) - cLng;
+      const r = Math.abs((alongX ? _aoV.z : _aoV.x) - cPer);
       if (lng > cut) { frontR += r; frontN++; }
       else if (lng < -cut) { backR += r; backN++; }
     }
@@ -225,13 +254,10 @@ export function autoOrientShip(obj: THREE.Object3D): void {
   const fAvg = frontN ? frontR / frontN : Infinity;
   const bAvg = backN ? backR / backN : Infinity;
   const noseSign = fAvg <= bAvg ? 1 : -1; // +1 → nose at +length end
-  const nose = new THREE.Vector3(
-    axis === "x" ? noseSign : 0,
-    axis === "y" ? noseSign : 0,
-    axis === "z" ? noseSign : 0,
-  );
-  // Rotate the detected nose axis onto the engine's canonical +Z forward.
-  _aoQ.setFromUnitVectors(nose.normalize(), new THREE.Vector3(0, 0, 1));
+  const nx = alongX ? noseSign : 0;
+  const nz = alongX ? 0 : noseSign;
+  // World-Y rotation that maps the nose direction onto +Z.
+  _aoQ.setFromAxisAngle(_aoUp, -Math.atan2(nx, nz));
   obj.quaternion.premultiply(_aoQ);
 }
 

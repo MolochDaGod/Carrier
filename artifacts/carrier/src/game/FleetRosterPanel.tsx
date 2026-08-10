@@ -4,7 +4,7 @@
  * the deployable fleet classes read as real 3D previews instead of a text list.
  */
 import { useEffect, useRef } from "react";
-import type { FactionId } from "@workspace/carrier-net";
+import { factionFleetShip, type FactionId } from "@workspace/carrier-net";
 import {
   FleetRosterShowcase,
   ROSTER_COLS,
@@ -12,8 +12,9 @@ import {
   ROSTER_ROLES,
 } from "./FleetRosterShowcase";
 
-function titleize(s: string): string {
-  return s.charAt(0).toUpperCase() + s.slice(1);
+function fleetLabel(faction: FactionId, role: string): string {
+  const authored = factionFleetShip(faction, role as (typeof ROSTER_ROLES)[number]);
+  return authored?.codename ?? role.charAt(0).toUpperCase() + role.slice(1);
 }
 
 export function FleetRosterPanel({
@@ -58,14 +59,15 @@ export function FleetRosterPanel({
         {ROSTER_ROLES.map((role) => (
           <div
             key={role}
-            className="relative flex items-end justify-center border border-white/5 pb-1.5"
+            className="relative flex flex-col items-center justify-end gap-0.5 border border-white/5 pb-1.5"
           >
             <span
-              className="rounded-sm bg-black/40 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em]"
+              className="rounded-sm bg-black/40 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em]"
               style={{ color }}
             >
-              {titleize(role)}
+              {fleetLabel(faction, role)}
             </span>
+            <span className="text-[8px] uppercase tracking-[0.22em] text-white/30">{role}</span>
           </div>
         ))}
       </div>

@@ -327,6 +327,21 @@ export interface CarrierHudState {
   aimScreen: { x: number; y: number } | null;
   /** Mothership rock-node missions + production. */
   motherMission: MotherMissionState;
+  /**
+   * Friendly mothership forcefield (aegis): 5× hull-length radius.
+   * While inside: 3× shield bank; after 10s out of combat, full regen in 5s.
+   */
+  aegis: {
+    active: boolean;
+    /** Mother entity id providing cover, if any. */
+    motherId: string | null;
+    /** Zone radius (m). */
+    radius: number;
+    /** Effective max shield under aegis (base × 3 when active). */
+    effMaxShield: number;
+    /** Seconds quiet since last damage (for UI countdown to fast regen). */
+    quietSec: number;
+  };
   /** Live hull-yaw tune for the controlled ship (degrees); null when idle. */
   hullTuneDeg: number | null;
   /** Brief save confirmation after numpad 5. */
